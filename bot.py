@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import html
 import logging
 import os
 import re
@@ -25,7 +26,7 @@ from aiogram.types import (
 )
 from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from aiogram.exceptions import TelegramUnauthorizedError
+from aiogram.exceptions import TelegramBadRequest, TelegramUnauthorizedError
 from dotenv import load_dotenv
 
 import notion_db as db
@@ -292,6 +293,13 @@ def sender_name(user) -> str:
     return name.strip()
 
 
+def code_bot_mention(suffix: str = "", bot_name: str | None = None) -> str:
+    """@бот в <code> без конфликта HTML-сущностей (ENTITY_TEXT_INVALID)."""
+    name = html.escape(bot_name or _bot_username or "taskFaster_bot")
+    body = f"&#64;{name}{suffix}"
+    return f"<code>{body}</code>"
+
+
 async def scope_title(scope: str, fallback: str = "Чат") -> str:
     if not is_telegram_chat(scope):
         return fallback
@@ -469,13 +477,29 @@ def users_delete_confirm_keyboard(alias_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-MAIN_MENU_TEXT = (
-    f"{e(PE.SMILE)} <b>TaskManager</b>\n\n"
-    "Выберите действие кнопкой ниже.\n\n"
-    f"• <b>Мои задачи</b> — без участников\n"
-    f"• <b>С людьми</b> — с указанием участника (<code>с имя</code>)\n"
-    f"• В переписке: <code>@taskFaster_bot текст завтра в 17:00</code>"
-)
+def main_menu_text(*, plain_emoji: bool = False) -> str:
+    smile = "😊" if plain_emoji else e(PE.SMILE)
+    return (
+        f"{smile} <b>TaskManager</b>\n\n"
+        "Выберите действие кнопкой ниже.\n\n"
+        f"• <b>Мои задачи</b> — без участников\n"
+        f"• <b>С людьми</b> — с указанием участника (<code>с имя</code>)\n"
+        f"• В переписке: {code_bot_mention(' текст завтра в 17:00')}"
+    )
+
+
+def dm_chat_label(
+    recipient_id: int,
+    chat_title_str: str,
+    assignee_user_id: int | None,
+    assignee_label: str | None,
+) -> str:
+    """Подпись чата в личном уведомлении (для исполнителя — как его записал автор)."""
+    if assignee_user_id and recipient_id == assignee_user_id:
+        if assignee_label:
+            return f"Личка с {assignee_label}"
+        return "Личка с пользователем"
+    return chat_title_str
 
 
 async def show_archive_list(
@@ -511,13 +535,23 @@ async def show_archive_list(
 
 async def show_main_menu(message: Message, edit: bool = False) -> None:
     kb = main_menu_keyboard()
+    text = main_menu_text()
     if edit:
         try:
-            await message.edit_text(MAIN_MENU_TEXT, reply_markup=kb)
+            await message.edit_text(text, reply_markup=kb)
             return
+        except TelegramBadRequest:
+            try:
+                await message.edit_text(main_menu_text(plain_emoji=True), reply_markup=kb)
+                return
+            except Exception:
+                pass
         except Exception:
             pass
-    await message.answer(MAIN_MENU_TEXT, reply_markup=kb)
+    try:
+        await message.answer(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await message.answer(main_menu_text(plain_emoji=True), reply_markup=kb)
 
 
 async def show_task_list(
@@ -554,7 +588,7 @@ async def send_users_list(message: Message, edit: bool = False) -> None:
             f"{e(PE.PEOPLE)} <b>Участники</b>\n\n"
             "Добавьте человека — потом в задаче укажите <code>с имя</code>.\n"
             "Пример в чате:\n"
-            f"<code>@{_bot_username or 'taskFaster_bot'} встреча завтра в 17:00 с имя</code>"
+            f"{code_bot_mention(' встреча завтра в 17:00 с имя')}"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             ib("Добавить", "users_add", PE.ADD_TEXT),
@@ -750,8 +784,9 @@ async def save_and_notify(
         if reminder_at:
             short += f" 🔔 в {fmt_datetime(reminder_at)}"
         await db.add_notification(uid, scope, task_id, short)
+        chat_label = dm_chat_label(uid, chat_title_str, assignee_user_id, assignee_label)
         try:
-            await bot.send_message(uid, f"🔔 {short}\n💬 {chat_title_str}")
+            await bot.send_message(uid, f"🔔 {short}\n💬 {chat_label}")
             if assignee_user_id and uid == assignee_user_id:
                 assignee_notified = True
         except Exception:
@@ -810,8 +845,14 @@ async def send_reminder(task_id: int, text: str, scope: str, chat_title_str: str
             reminder_text = (
                 f"🔔 <b>Напоминание о задаче!</b> #{num}{assignee_line}\n📝 {text}"
             )
+            chat_label = dm_chat_label(
+                uid,
+                chat_title_str,
+                assignee_id,
+                task.get("assignee_label"),
+            )
             try:
-                await bot.send_message(uid, f"🔔 {reminder_text}\n💬 {chat_title_str}")
+                await bot.send_message(uid, f"🔔 {reminder_text}\n💬 {chat_label}")
             except Exception:
                 pass
 
@@ -1008,14 +1049,13 @@ def command_args(message: Message) -> str:
 
 
 def help_text() -> str:
-    bot = _bot_username or "taskFaster_bot"
     return (
         f"{e(PE.INFO)} <b>Как добавить задачу</b>\n\n"
         "<b>В чате с человеком или в группе:</b>\n"
-        f"<code>@{bot} текст завтра в 17:00</code>\n"
+        f"{code_bot_mention(' текст завтра в 17:00')}\n"
         "→ нажмите на карточку <b>над полем ввода</b>\n\n"
         f"<b>С участником</b> (сначала «{e(PE.PROFILE)} Участники»):\n"
-        f"<code>@{bot} встреча завтра в 17:00 с имя</code>\n\n"
+        f"{code_bot_mention(' встреча завтра в 17:00 с имя')}\n\n"
         f"<b>Время (Москва):</b>\n"
         "• <code>завтра в 19:00</code>\n"
         "• <code>сегодня в 15:30</code>\n"
