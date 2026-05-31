@@ -68,7 +68,8 @@ _bot_username: str = ""
 # user_id -> последний chat_type из inline_query
 _inline_user_chat_type: dict[int, str] = {}
 
-# «ночевка завтра в 17:00 с женя»
+# «ночевка завтра в 17:00 с <имя>»
+_pending_add_user: set[int] = set()
 _ASSIGNEE_SUFFIX_RE = re.compile(
     r"\s+(?:с|для)\s+([a-zA-Zа-яА-ЯёЁ0-9_.\-]{2,32})\s*$",
     re.IGNORECASE,
@@ -305,46 +306,125 @@ async def scope_title(scope: str, fallback: str = "Чат") -> str:
     return fallback
 
 
-def tasks_keyboard(tasks: list[dict]) -> InlineKeyboardMarkup:
+def task_display_no(task: dict, viewer_id: int | None) -> int:
+    """Личный номер задачи для пользователя (не глобальный id из БД)."""
+    if viewer_id is not None:
+        if task.get("from_user_id") == viewer_id and task.get("creator_number"):
+            return task["creator_number"]
+        if task.get("assignee_user_id") == viewer_id and task.get("assignee_number"):
+            return task["assignee_number"]
+    return task.get("creator_number") or task["id"]
+
+
+def tasks_keyboard(tasks: list[dict], viewer_id: int | None = None) -> InlineKeyboardMarkup:
     buttons = []
-    for i, t in enumerate(tasks, 1):
+    for t in tasks:
+        num = task_display_no(t, viewer_id)
         buttons.append([InlineKeyboardButton(
-            text=f"✅ #{i} выполнено",
+            text=f"✅ #{num} выполнено",
             callback_data=f"done_task:{t['id']}",
         )])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def format_tasks_list(tasks: list[dict], title: str = "📋 <b>Открытые задачи:</b>") -> str:
+def format_tasks_list(
+    tasks: list[dict],
+    title: str = "📋 <b>Открытые задачи:</b>",
+    viewer_id: int | None = None,
+) -> str:
     if not tasks:
         return "📭 Открытых задач нет"
     lines = [f"{title}\n"]
-    for i, t in enumerate(tasks, 1):
+    for t in tasks:
+        num = task_display_no(t, viewer_id)
         added = fmt_date(t.get("added_at"))
         deadline = f" · ⏰ до {fmt_date(t['deadline'])}" if t.get("deadline") else ""
         reminder = f" · 🔔 напомнить в {fmt_datetime(t.get('reminder_at'))}" if t.get("reminder_at") else ""
         assignee = f" · 🎯 {t['assignee_label']}" if t.get("assignee_label") else ""
         lines.append(
-            f"<b>#{i}</b> {t['text']}\n"
+            f"<b>#{num}</b> {t['text']}\n"
             f"    👤 {t['from_user']}{assignee}{deadline}{reminder}\n"
             f"    💬 {t['chat_title']} · 📅 {added}"
         )
     return "\n\n".join(lines)
 
 
-def format_archive_list(tasks: list[dict]) -> str:
+def format_archive_list(tasks: list[dict], viewer_id: int | None = None) -> str:
     if not tasks:
         return "📭 Архив пуст"
     lines = ["🗄 <b>Архив задач:</b>\n"]
-    for i, t in enumerate(tasks, 1):
+    for t in tasks:
+        num = task_display_no(t, viewer_id)
         closed = fmt_date(t.get("closed_at") or t.get("added_at"))
         deadline = f" · ⏰ {fmt_date(t['deadline'])}" if t.get("deadline") else ""
         lines.append(
-            f"<b>#{i}</b> {t['text']}\n"
+            f"<b>#{num}</b> {t['text']}\n"
             f"    👤 {t['from_user']}{deadline}\n"
             f"    ✅ закрыто {closed}"
         )
     return "\n\n".join(lines)
+
+
+def users_list_keyboard(aliases: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for a in aliases:
+        label = a["display_name"]
+        if len(label) > 18:
+            label = label[:17] + "…"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"📨 {label}",
+                callback_data=f"user_invite:{a['id']}",
+            ),
+            InlineKeyboardButton(
+                text="🗑",
+                callback_data=f"user_del:{a['id']}",
+            ),
+        ])
+    rows.append([
+        InlineKeyboardButton(text="➕ Добавить", callback_data="users_add"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def users_delete_confirm_keyboard(alias_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Удалить", callback_data=f"user_del_ok:{alias_id}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="users_list"),
+        ],
+    ])
+
+
+async def send_users_list(message: Message, edit: bool = False) -> None:
+    owner_id = message.from_user.id
+    aliases = await db.list_user_aliases(owner_id)
+    if not aliases:
+        text = (
+            "👤 <b>Участники задач</b>\n\n"
+            "Пока никого нет. Нажмите «➕ Добавить» или отправьте:\n"
+            "<code>/addusers</code> <i>имя</i>\n\n"
+            "В переписке:\n"
+            "<code>@taskFaster_bot задача завтра в 17:00 с имя</code>"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="➕ Добавить", callback_data="users_add"),
+        ]])
+    else:
+        lines = ["👤 <b>Ваши участники:</b>\n"]
+        for a in aliases:
+            st = "✅ подключён" if a.get("linked_user_id") else "⏳ ждёт"
+            lines.append(f"• <b>{a['display_name']}</b> — {st}")
+        lines.append("\n📨 — приглашение · 🗑 — удалить")
+        text = "\n".join(lines)
+        kb = users_list_keyboard(aliases)
+    if edit and message.reply_markup:
+        try:
+            await message.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await message.answer(text, reply_markup=kb)
 
 
 def format_notifications_list(notifications: list[dict]) -> str:
@@ -479,10 +559,13 @@ async def save_and_notify(
     assignee_label: str | None = None,
     alias: dict | None = None,
 ) -> int:
-    task_id = await db.add_task(
+    created = await db.add_task(
         text, scope, chat_title_str, user_name, user_id, deadline, reminder_at,
         assignee_user_id, assignee_label,
     )
+    task_id = created["id"]
+    creator_no = created["creator_number"]
+    assignee_no = created.get("assignee_number")
     await touch_scope(scope, chat_title_str, user_id)
 
     if assignee_user_id:
@@ -492,7 +575,7 @@ async def save_and_notify(
     reminder_line = f"\n🔔 Напоминание: <b>{fmt_datetime(reminder_at)}</b>" if reminder_at else ""
     assignee_line = f"\n🎯 Исполнитель: <b>{assignee_label}</b>" if assignee_label else ""
     notify_text = (
-        f"📝 <b>Новая задача</b> #{task_id}\n"
+        f"📝 <b>Новая задача</b> #{creator_no}\n"
         f"👤 {user_name}{assignee_line}{deadline_line}{reminder_line}\n"
         f"📝 {text}"
     )
@@ -505,17 +588,17 @@ async def save_and_notify(
         except Exception as e:
             log.warning(f"Cannot post to chat {scope}: {e}")
 
-    short = f"📝 Новая задача #{task_id}: {text[:80]}"
-    if assignee_label:
-        short += f" → {assignee_label}"
-    if deadline:
-        short += f" (до {fmt_date(deadline)})"
-    if reminder_at:
-        short += f" 🔔 в {fmt_datetime(reminder_at)}"
-
     notify_uids = dm_notify_recipients(user_id, assignee_user_id, posted_to_chat)
     assignee_notified = False
     for uid in notify_uids:
+        num = creator_no if uid == user_id else (assignee_no or creator_no)
+        short = f"📝 Новая задача #{num}: {text[:80]}"
+        if assignee_label:
+            short += f" → {assignee_label}"
+        if deadline:
+            short += f" (до {fmt_date(deadline)})"
+        if reminder_at:
+            short += f" 🔔 в {fmt_datetime(reminder_at)}"
         await db.add_notification(uid, scope, task_id, short)
         try:
             await bot.send_message(uid, f"🔔 {short}\n💬 {chat_title_str}")
@@ -560,11 +643,12 @@ async def send_reminder(task_id: int, text: str, scope: str, chat_title_str: str
     assignee_line = ""
     if task and task.get("assignee_label"):
         assignee_line = f"\n🎯 {task['assignee_label']}"
-    reminder_text = f"🔔 <b>Напоминание о задаче!</b> #{task_id}{assignee_line}\n📝 {text}"
 
     if is_telegram_chat(scope) and scope not in _opaque_scopes:
+        num = task_display_no(task, task["from_user_id"]) if task else task_id
+        chat_text = f"🔔 <b>Напоминание о задаче!</b> #{num}{assignee_line}\n📝 {text}"
         try:
-            await bot.send_message(int(scope), reminder_text)
+            await bot.send_message(int(scope), chat_text)
         except Exception as e:
             log.warning(f"Cannot send reminder to chat {scope}: {e}")
 
@@ -572,6 +656,10 @@ async def send_reminder(task_id: int, text: str, scope: str, chat_title_str: str
         creator_id = task["from_user_id"]
         assignee_id = task.get("assignee_user_id")
         for uid in dm_notify_recipients(creator_id, assignee_id, posted_to_chat=False):
+            num = task_display_no(task, uid)
+            reminder_text = (
+                f"🔔 <b>Напоминание о задаче!</b> #{num}{assignee_line}\n📝 {text}"
+            )
             try:
                 await bot.send_message(uid, f"🔔 {reminder_text}\n💬 {chat_title_str}")
             except Exception:
@@ -601,7 +689,7 @@ async def handle_inline(inline_query: InlineQuery) -> None:
                 InlineQueryResultArticle(
                     id="hint_task",
                     title="📝 Добавить задачу",
-                    description="Например: ночевка завтра в 17:00 с женя",
+                    description="Например: задача завтра в 17:00 с имя",
                     input_message_content=InputTextMessageContent(
                         message_text="Используй: @taskFaster_bot задача [текст]",
                         parse_mode=None,
@@ -771,9 +859,9 @@ async def create_task_from_text(message: Message, text: str) -> None:
     if not text:
         await message.answer(
             "📝 <b>Как добавить задачу:</b>\n\n"
-            "• Inline: <code>@taskFaster_bot ночевка завтра в 19:00 с женя</code>\n"
-            "• Команда: <code>/task ночевка завтра в 19:00 с женя</code>\n"
-            "• Участники: <code>/addusers женя</code> — приглашение для исполнителя\n\n"
+            "• Inline: <code>@taskFaster_bot задача завтра в 19:00 с имя</code>\n"
+            "• Команда: <code>/task задача завтра в 19:00 с имя</code>\n"
+            "• Участники: <code>/users</code> — список и кнопки\n\n"
             "<b>Форматы времени:</b>\n"
             "• <code>завтра в 15:30</code> — завтра в 15:30\n"
             "• <code>сегодня в 15:30</code> — сегодня в 15:30\n"
@@ -811,7 +899,9 @@ async def create_task_from_text(message: Message, text: str) -> None:
         deadline_s = f" · ⏰ {fmt_date(deadline)}" if deadline else ""
         reminder = f" · 🔔 напомнить в {fmt_datetime(reminder_at)}" if reminder_at else ""
         who = f" · 🎯 {assignee_label}" if assignee_label else ""
-        await message.answer(f"✅ Задача #{task_id} сохранена{who}{deadline_s}{reminder}\n📝 {task_text}")
+        task = await db.get_task(task_id)
+        num = task_display_no(task, user.id) if task else task_id
+        await message.answer(f"✅ Задача #{num} сохранена{who}{deadline_s}{reminder}\n📝 {task_text}")
     except Exception:
         log.exception("Error saving task from message")
         await message.answer("❌ Не удалось сохранить задачу")
@@ -822,36 +912,16 @@ async def cmd_task(message: Message) -> None:
     await create_task_from_text(message, command_args(message))
 
 
-async def reply_users_list(message: Message) -> None:
-    aliases = await db.list_user_aliases(message.from_user.id)
-    if not aliases:
-        await message.answer(
-            "👤 <b>Участники задач</b>\n\n"
-            "Пока никого нет. Создайте:\n"
-            "<code>/addusers женя</code>\n\n"
-            "В чате с человеком:\n"
-            "<code>@taskFaster_bot ночевка завтра в 17:00 с женя</code>",
-        )
-        return
-    lines = ["👤 <b>Ваши участники:</b>\n"]
-    for a in aliases:
-        st = "✅ подключён" if a.get("linked_user_id") else "⏳ ждёт подключения"
-        lines.append(f"• <b>{a['display_name']}</b> — {st}")
-    lines.append("\nДобавить: <code>/addusers имя</code>")
-    lines.append("Удалить: <code>/delusers имя</code>")
-    await message.answer("\n".join(lines))
-
-
 @dp.message(Command("users"))
 async def cmd_users(message: Message) -> None:
-    await reply_users_list(message)
+    await send_users_list(message)
 
 
 @dp.message(Command("addusers", "adduser"))
 async def cmd_addusers(message: Message) -> None:
     name = command_args(message).strip()
     if not name:
-        await reply_users_list(message)
+        await send_users_list(message)
         return
     if len(name) > 32:
         await message.answer("❌ Имя слишком длинное (макс. 32 символа).")
@@ -864,20 +934,13 @@ async def cmd_addusers(message: Message) -> None:
 async def cmd_delusers(message: Message) -> None:
     name = command_args(message).strip()
     if not name:
-        await message.answer(
-            "🗑 Укажите имя участника:\n"
-            "<code>/delusers женя</code>\n\n"
-            "Список: <code>/users</code>",
-        )
+        await message.answer("🗑 Выберите участника в /users и нажмите 🗑")
         return
     removed = await db.delete_user_alias(message.from_user.id, name)
     if not removed:
         await message.answer(f"❌ Участник «{name}» не найден. Список: /users")
         return
-    await message.answer(
-        f"🗑 Участник <b>{removed['display_name']}</b> удалён.\n"
-        "Новые задачи с этим именем создавать нельзя, пока не добавите снова через /addusers.",
-    )
+    await message.answer(f"🗑 Участник <b>{removed['display_name']}</b> удалён.")
 
 
 @dp.business_connection()
@@ -942,13 +1005,12 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
     scope = scope_from_message(message)
     await touch_scope(scope, chat_title(message), user_id)
     await message.answer(
-        "👋 <b>ProcrastinationManager активен!</b>\n\n"
+        "👋 <b>TaskManager активен!</b>\n\n"
         "<b>Добавить задачу:</b>\n"
-        "  1️⃣ Inline: <code>@taskFaster_bot ночевка завтра в 19:00 с женя</code>\n"
+        "  1️⃣ Inline: <code>@taskFaster_bot задача завтра в 19:00 с имя</code>\n"
         "     → нажми на карточку <b>над полем ввода</b>\n"
-        "  2️⃣ Команда: <code>/task ночевка завтра в 19:00 с женя</code>\n"
-        "  3️⃣ Участники: <code>/addusers женя</code> — приглашение\n"
-        "     Список: <code>/users</code>\n\n"
+        "  2️⃣ Команда: <code>/task задача завтра в 19:00 с имя</code>\n"
+        "  3️⃣ Участники: <code>/users</code> — кнопки добавить / удалить / пригласить\n\n"
         "<b>Форматы времени:</b>\n"
         "  • <code>завтра в 19:00</code> — завтра в 19:00\n"
         "  • <code>сегодня в 15:30</code> — сегодня в 15:30\n"
@@ -958,7 +1020,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         "Задачи привязаны к <b>этому чату</b> — у каждой переписки свой список.\n\n"
         "<b>Команды:</b>\n"
         "/tasks — открытые задачи\n"
-        "/users — участники · /delusers имя — удалить\n"
+        "/users — участники (кнопки)\n"
         "/archive — архив\n"
         "/notifications — уведомления\n"
         "/overdue — просроченные"
@@ -976,12 +1038,12 @@ async def cmd_tasks(message: Message) -> None:
         if not tasks:
             await message.answer("📭 У тебя пока нет задач. Добавь через inline в чате!")
             return
-        text = format_tasks_list(tasks, "📋 <b>Твои задачи:</b>")
+        text = format_tasks_list(tasks, "📋 <b>Твои задачи:</b>", viewer_id=user_id)
     else:
         tasks = await db.get_tasks(scope)
-        text = format_tasks_list(tasks)
+        text = format_tasks_list(tasks, viewer_id=user_id)
 
-    kb = tasks_keyboard(tasks) if tasks else None
+    kb = tasks_keyboard(tasks, viewer_id=user_id) if tasks else None
     await message.answer(text, reply_markup=kb)
 
 
@@ -993,10 +1055,12 @@ async def cmd_archive(message: Message) -> None:
 
     if message.chat.type == ChatType.PRIVATE and message.chat.id == user_id:
         tasks = await db.get_archived_for_user(user_id)
+        text = format_archive_list(tasks, viewer_id=user_id)
     else:
         tasks = await db.get_archived_tasks(scope)
+        text = format_archive_list(tasks, viewer_id=user_id)
 
-    await message.answer(format_archive_list(tasks))
+    await message.answer(text)
 
 
 @dp.message(Command("notifications"))
@@ -1033,13 +1097,28 @@ async def cmd_overdue(message: Message) -> None:
         lines.append(
             f"• {t['text']}\n  👤 {t['from_user']} · ⏰ {fmt_date(t['deadline'])}"
         )
-    await message.answer("\n\n".join(lines), reply_markup=tasks_keyboard(tasks))
+    await message.answer(
+        "\n\n".join(lines),
+        reply_markup=tasks_keyboard(tasks, viewer_id=user_id),
+    )
 
 
 @dp.message(F.text & F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE}))
 async def handle_chat_activity(message: Message) -> None:
     """Любая активность в чате — регистрируем участника и контекст."""
     if message.from_user.is_bot:
+        return
+    if message.from_user.id in _pending_add_user:
+        _pending_add_user.discard(message.from_user.id)
+        name = (message.text or "").strip()
+        if not name or name.startswith("/"):
+            await message.answer("❌ Отправьте имя участника текстом (не команду).")
+            return
+        if len(name) > 32:
+            await message.answer("❌ Имя слишком длинное (макс. 32 символа).")
+            return
+        alias = await db.create_user_alias(message.from_user.id, name)
+        await send_alias_invite(message, alias)
         return
     scope = scope_from_message(message)
     title = chat_title(message)
@@ -1065,6 +1144,57 @@ async def on_bot_added(event: ChatMemberUpdated) -> None:
 #  CALLBACK КНОПКИ ✅
 # ════════════════════════════════════════════════════════════════
 
+@dp.callback_query(F.data == "users_add")
+async def cb_users_add(callback: CallbackQuery) -> None:
+    _pending_add_user.add(callback.from_user.id)
+    await callback.answer()
+    await callback.message.answer(
+        "✏️ <b>Новый участник</b>\n\nНапишите имя одним сообщением (как будете указывать в задаче после «с»).",
+    )
+
+
+@dp.callback_query(F.data == "users_list")
+async def cb_users_list(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await send_users_list(callback.message, edit=True)
+
+
+@dp.callback_query(F.data.startswith("user_invite:"))
+async def cb_user_invite(callback: CallbackQuery) -> None:
+    alias_id = int(callback.data.split(":", 1)[1])
+    alias = await db.get_user_alias_by_id(callback.from_user.id, alias_id)
+    if not alias:
+        await callback.answer("Не найден", show_alert=True)
+        return
+    await callback.answer("Приглашение отправлено")
+    await send_alias_invite(callback.message, alias)
+
+
+@dp.callback_query(F.data.startswith("user_del:"))
+async def cb_user_del_ask(callback: CallbackQuery) -> None:
+    alias_id = int(callback.data.split(":", 1)[1])
+    alias = await db.get_user_alias_by_id(callback.from_user.id, alias_id)
+    if not alias:
+        await callback.answer("Не найден", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_text(
+        f"🗑 Удалить участника <b>{alias['display_name']}</b>?",
+        reply_markup=users_delete_confirm_keyboard(alias_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("user_del_ok:"))
+async def cb_user_del_ok(callback: CallbackQuery) -> None:
+    alias_id = int(callback.data.split(":", 1)[1])
+    removed = await db.delete_user_alias_by_id(callback.from_user.id, alias_id)
+    if not removed:
+        await callback.answer("Уже удалён", show_alert=True)
+        return
+    await callback.answer("Удалено")
+    await send_users_list(callback.message, edit=True)
+
+
 @dp.callback_query(F.data.startswith("done_task:"))
 async def cb_done_task(callback: CallbackQuery) -> None:
     task_id = int(callback.data.split(":", 1)[1])
@@ -1079,7 +1209,8 @@ async def cb_done_task(callback: CallbackQuery) -> None:
         return
 
     await db.close_task(task_id)
-    await callback.answer("✅ Выполнено!")
+    num = task_display_no(task, user_id)
+    await callback.answer(f"✅ Задача #{num} выполнена!")
 
     # Удаляем запланированное напоминание, если было
     try:

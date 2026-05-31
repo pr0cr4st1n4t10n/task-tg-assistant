@@ -79,7 +79,45 @@ async def init_db() -> None:
         await db.commit()
         await _ensure_reminder_column(db)
         await _ensure_assignee_columns(db)
+        await _ensure_task_numbers(db)
         await _migrate_legacy(db)
+
+
+async def _ensure_task_numbers(db: aiosqlite.Connection) -> None:
+    cursor = await db.execute("PRAGMA table_info(tasks)")
+    cols = {row[1] for row in await cursor.fetchall()}
+    if "creator_number" not in cols:
+        await db.execute("ALTER TABLE tasks ADD COLUMN creator_number INTEGER")
+    if "assignee_number" not in cols:
+        await db.execute("ALTER TABLE tasks ADD COLUMN assignee_number INTEGER")
+    await db.commit()
+
+    cursor = await db.execute(
+        "SELECT id, from_user_id FROM tasks WHERE creator_number IS NULL ORDER BY id"
+    )
+    rows = await cursor.fetchall()
+    counters: dict[int, int] = {}
+    for task_id, uid in rows:
+        counters[uid] = counters.get(uid, 0) + 1
+        await db.execute(
+            "UPDATE tasks SET creator_number=? WHERE id=?",
+            (counters[uid], task_id),
+        )
+
+    cursor = await db.execute(
+        """SELECT id, assignee_user_id FROM tasks
+           WHERE assignee_user_id IS NOT NULL AND assignee_number IS NULL
+           ORDER BY id"""
+    )
+    rows = await cursor.fetchall()
+    a_counters: dict[int, int] = {}
+    for task_id, uid in rows:
+        a_counters[uid] = a_counters.get(uid, 0) + 1
+        await db.execute(
+            "UPDATE tasks SET assignee_number=? WHERE id=?",
+            (a_counters[uid], task_id),
+        )
+    await db.commit()
 
 
 async def _ensure_assignee_columns(db: aiosqlite.Connection) -> None:
@@ -386,6 +424,32 @@ async def list_user_aliases(owner_id: int) -> list[dict]:
         return [_alias_row(r) for r in rows]
 
 
+async def get_user_alias_by_id(owner_id: int, alias_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, owner_id, alias_key, display_name, linked_user_id, join_token, created_at "
+            "FROM user_aliases WHERE owner_id=? AND id=?",
+            (owner_id, alias_id),
+        )
+        row = await cursor.fetchone()
+        return _alias_row(row) if row else None
+
+
+async def delete_user_alias_by_id(owner_id: int, alias_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, owner_id, alias_key, display_name, linked_user_id, join_token, created_at "
+            "FROM user_aliases WHERE owner_id=? AND id=?",
+            (owner_id, alias_id),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        await db.execute("DELETE FROM user_aliases WHERE id=?", (alias_id,))
+        await db.commit()
+        return _alias_row(row)
+
+
 async def delete_user_alias(owner_id: int, name: str) -> dict | None:
     """Удаляет участника. Возвращает удалённую запись или None."""
     key = normalize_alias_key(name)
@@ -406,6 +470,24 @@ async def delete_user_alias(owner_id: int, name: str) -> dict | None:
         return _alias_row(row)
 
 
+async def _next_creator_number(db: aiosqlite.Connection, user_id: int) -> int:
+    cursor = await db.execute(
+        "SELECT COALESCE(MAX(creator_number), 0) FROM tasks WHERE from_user_id=?",
+        (user_id,),
+    )
+    row = await cursor.fetchone()
+    return (row[0] or 0) + 1
+
+
+async def _next_assignee_number(db: aiosqlite.Connection, user_id: int) -> int:
+    cursor = await db.execute(
+        "SELECT COALESCE(MAX(assignee_number), 0) FROM tasks WHERE assignee_user_id=?",
+        (user_id,),
+    )
+    row = await cursor.fetchone()
+    return (row[0] or 0) + 1
+
+
 # ─────────────────────────── ЗАДАЧИ ─────────────────────────────
 
 async def add_task(
@@ -418,21 +500,29 @@ async def add_task(
     reminder_at: str | None = None,
     assignee_user_id: int | None = None,
     assignee_label: str | None = None,
-) -> int:
+) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
+        creator_number = await _next_creator_number(db, from_user_id)
+        assignee_number = None
+        if assignee_user_id:
+            assignee_number = await _next_assignee_number(db, assignee_user_id)
         cursor = await db.execute(
             """INSERT INTO tasks
                (text, scope, chat_title, from_user, from_user_id, deadline, reminder_at,
-                assignee_user_id, assignee_label, added_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                assignee_user_id, assignee_label, creator_number, assignee_number, added_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 text, scope, chat_title, from_user, from_user_id, deadline, reminder_at,
-                assignee_user_id, assignee_label,
+                assignee_user_id, assignee_label, creator_number, assignee_number,
                 datetime.utcnow().isoformat(timespec="seconds"),
             ),
         )
         await db.commit()
-        return cursor.lastrowid
+        return {
+            "id": cursor.lastrowid,
+            "creator_number": creator_number,
+            "assignee_number": assignee_number,
+        }
 
 
 async def get_tasks(scope: str, only_open: bool = True) -> list[dict]:
