@@ -542,48 +542,165 @@ async def get_tasks(scope: str, only_open: bool = True) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-async def get_tasks_for_user(user_id: int, only_open: bool = True) -> list[dict]:
-    """Задачи, которые пользователь создал или на которые назначен исполнителем."""
+_PERSONAL_WHERE = (
+    "(assignee_label IS NULL OR assignee_label = '')"
+)
+_SHARED_WHERE = (
+    "(assignee_label IS NOT NULL AND assignee_label != '')"
+)
+
+
+async def get_personal_tasks_for_user(user_id: int, only_open: bool = True) -> list[dict]:
+    """Свои задачи без указания участника."""
     status_filter = "AND status='open'" if only_open else ""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             f"""SELECT * FROM tasks
-                WHERE (from_user_id=? OR assignee_user_id=?)
+                WHERE from_user_id=? AND {_PERSONAL_WHERE}
+                {status_filter}
+                ORDER BY id DESC""",
+            (user_id,),
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_shared_tasks_for_user(user_id: int, only_open: bool = True) -> list[dict]:
+    """Задачи с участниками: вы создали с «с имя» или вас назначили."""
+    status_filter = "AND status='open'" if only_open else ""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"""SELECT * FROM tasks
+                WHERE (
+                    (from_user_id=? AND {_SHARED_WHERE})
+                    OR assignee_user_id=?
+                )
                 {status_filter}
                 ORDER BY id DESC""",
             (user_id, user_id),
         )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in await cursor.fetchall()]
 
 
-async def get_archived_for_user(user_id: int) -> list[dict]:
+async def get_tasks_for_user(user_id: int, only_open: bool = True) -> list[dict]:
+    personal = await get_personal_tasks_for_user(user_id, only_open)
+    shared = await get_shared_tasks_for_user(user_id, only_open)
+    seen: set[int] = set()
+    merged: list[dict] = []
+    for t in personal + shared:
+        if t["id"] not in seen:
+            seen.add(t["id"])
+            merged.append(t)
+    return merged
+
+
+async def get_personal_tasks_for_scope(scope: str, only_open: bool = True) -> list[dict]:
+    status_filter = "AND status='open'" if only_open else ""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT * FROM tasks
-               WHERE (from_user_id=? OR assignee_user_id=?) AND status='done'
-               ORDER BY closed_at DESC, id DESC""",
+            f"""SELECT * FROM tasks
+                WHERE scope=? AND {_PERSONAL_WHERE} {status_filter}
+                ORDER BY id DESC""",
+            (scope,),
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_shared_tasks_for_scope(scope: str, only_open: bool = True) -> list[dict]:
+    status_filter = "AND status='open'" if only_open else ""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"""SELECT * FROM tasks
+                WHERE scope=? AND {_SHARED_WHERE} {status_filter}
+                ORDER BY id DESC""",
+            (scope,),
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_archived_personal_for_user(user_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"""SELECT * FROM tasks
+                WHERE from_user_id=? AND {_PERSONAL_WHERE} AND status='done'
+                ORDER BY closed_at DESC, id DESC""",
+            (user_id,),
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_archived_shared_for_user(user_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"""SELECT * FROM tasks
+                WHERE (
+                    (from_user_id=? AND {_SHARED_WHERE})
+                    OR assignee_user_id=?
+                ) AND status='done'
+                ORDER BY closed_at DESC, id DESC""",
             (user_id, user_id),
         )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in await cursor.fetchall()]
 
 
-async def get_overdue_tasks_for_user(user_id: int) -> list[dict]:
+async def get_archived_for_user(user_id: int) -> list[dict]:
+    p = await get_archived_personal_for_user(user_id)
+    s = await get_archived_shared_for_user(user_id)
+    seen: set[int] = set()
+    out: list[dict] = []
+    for t in p + s:
+        if t["id"] not in seen:
+            seen.add(t["id"])
+            out.append(t)
+    return out
+
+
+async def get_overdue_personal_for_user(user_id: int) -> list[dict]:
     today = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT * FROM tasks
-               WHERE status='open' AND deadline IS NOT NULL AND deadline < ?
-               AND (from_user_id=? OR assignee_user_id=?)
-               ORDER BY deadline ASC""",
+            f"""SELECT * FROM tasks
+                WHERE status='open' AND deadline IS NOT NULL AND deadline < ?
+                AND from_user_id=? AND {_PERSONAL_WHERE}
+                ORDER BY deadline ASC""",
+            (today, user_id),
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_overdue_shared_for_user(user_id: int) -> list[dict]:
+    today = date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"""SELECT * FROM tasks
+                WHERE status='open' AND deadline IS NOT NULL AND deadline < ?
+                AND (
+                    (from_user_id=? AND {_SHARED_WHERE})
+                    OR assignee_user_id=?
+                )
+                ORDER BY deadline ASC""",
             (today, user_id, user_id),
         )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_overdue_tasks_for_user(user_id: int) -> list[dict]:
+    p = await get_overdue_personal_for_user(user_id)
+    s = await get_overdue_shared_for_user(user_id)
+    seen: set[int] = set()
+    out: list[dict] = []
+    for t in p + s:
+        if t["id"] not in seen:
+            seen.add(t["id"])
+            out.append(t)
+    return out
 
 
 async def get_tasks_for_scopes(scopes: list[str], only_open: bool = True) -> list[dict]:
