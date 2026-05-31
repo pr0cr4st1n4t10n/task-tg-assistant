@@ -64,9 +64,32 @@ async def init_db() -> None:
                 created_at TEXT NOT NULL
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_aliases (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id       INTEGER NOT NULL,
+                alias_key      TEXT    NOT NULL,
+                display_name   TEXT    NOT NULL,
+                linked_user_id INTEGER,
+                join_token     TEXT    NOT NULL UNIQUE,
+                created_at     TEXT    NOT NULL,
+                UNIQUE(owner_id, alias_key)
+            )
+        """)
         await db.commit()
         await _ensure_reminder_column(db)
+        await _ensure_assignee_columns(db)
         await _migrate_legacy(db)
+
+
+async def _ensure_assignee_columns(db: aiosqlite.Connection) -> None:
+    cursor = await db.execute("PRAGMA table_info(tasks)")
+    cols = {row[1] for row in await cursor.fetchall()}
+    if "assignee_user_id" not in cols:
+        await db.execute("ALTER TABLE tasks ADD COLUMN assignee_user_id INTEGER")
+    if "assignee_label" not in cols:
+        await db.execute("ALTER TABLE tasks ADD COLUMN assignee_label TEXT")
+    await db.commit()
 
 
 async def _ensure_reminder_column(db: aiosqlite.Connection) -> None:
@@ -261,6 +284,108 @@ async def resolve_notify_token(token: str) -> tuple[str, str] | None:
         return (row[0], row[1]) if row else None
 
 
+def normalize_alias_key(name: str) -> str:
+    return name.strip().lower()
+
+
+def _alias_row(row) -> dict:
+    return {
+        "id": row[0],
+        "owner_id": row[1],
+        "alias_key": row[2],
+        "display_name": row[3],
+        "linked_user_id": row[4],
+        "join_token": row[5],
+        "created_at": row[6],
+    }
+
+
+async def create_user_alias(owner_id: int, display_name: str) -> dict:
+    key = normalize_alias_key(display_name)
+    token = secrets.token_urlsafe(9).replace("-", "x").replace("_", "y")[:16]
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, owner_id, alias_key, display_name, linked_user_id, join_token, created_at "
+            "FROM user_aliases WHERE owner_id=? AND alias_key=?",
+            (owner_id, key),
+        )
+        existing = await cursor.fetchone()
+        if existing:
+            return _alias_row(existing)
+        cursor = await db.execute(
+            """INSERT INTO user_aliases
+               (owner_id, alias_key, display_name, linked_user_id, join_token, created_at)
+               VALUES (?, ?, ?, NULL, ?, ?)""",
+            (owner_id, key, display_name.strip(), token, now),
+        )
+        await db.commit()
+        alias_id = cursor.lastrowid
+    return {
+        "id": alias_id,
+        "owner_id": owner_id,
+        "alias_key": key,
+        "display_name": display_name.strip(),
+        "linked_user_id": None,
+        "join_token": token,
+        "created_at": now,
+    }
+
+
+async def get_user_alias(owner_id: int, name: str) -> dict | None:
+    key = normalize_alias_key(name)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, owner_id, alias_key, display_name, linked_user_id, join_token, created_at "
+            "FROM user_aliases WHERE owner_id=? AND alias_key=?",
+            (owner_id, key),
+        )
+        row = await cursor.fetchone()
+        return _alias_row(row) if row else None
+
+
+async def get_alias_by_join_token(token: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, owner_id, alias_key, display_name, linked_user_id, join_token, created_at "
+            "FROM user_aliases WHERE join_token=?",
+            (token,),
+        )
+        row = await cursor.fetchone()
+        return _alias_row(row) if row else None
+
+
+async def link_alias_user(join_token: str, user_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, owner_id, alias_key, display_name, linked_user_id, join_token, created_at "
+            "FROM user_aliases WHERE join_token=?",
+            (join_token,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        await db.execute(
+            "UPDATE user_aliases SET linked_user_id=? WHERE join_token=?",
+            (user_id, join_token),
+        )
+        await db.commit()
+        alias = _alias_row(row)
+        alias["linked_user_id"] = user_id
+        return alias
+
+
+async def list_user_aliases(owner_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, owner_id, alias_key, display_name, linked_user_id, join_token, created_at "
+            "FROM user_aliases WHERE owner_id=? ORDER BY display_name COLLATE NOCASE",
+            (owner_id,),
+        )
+        rows = await cursor.fetchall()
+        return [_alias_row(r) for r in rows]
+
+
 # ─────────────────────────── ЗАДАЧИ ─────────────────────────────
 
 async def add_task(
@@ -271,14 +396,18 @@ async def add_task(
     from_user_id: int,
     deadline: str | None = None,
     reminder_at: str | None = None,
+    assignee_user_id: int | None = None,
+    assignee_label: str | None = None,
 ) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO tasks
-               (text, scope, chat_title, from_user, from_user_id, deadline, reminder_at, added_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (text, scope, chat_title, from_user, from_user_id, deadline, reminder_at,
+                assignee_user_id, assignee_label, added_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 text, scope, chat_title, from_user, from_user_id, deadline, reminder_at,
+                assignee_user_id, assignee_label,
                 datetime.utcnow().isoformat(timespec="seconds"),
             ),
         )
