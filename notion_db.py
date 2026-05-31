@@ -471,8 +471,10 @@ async def delete_user_alias(owner_id: int, name: str) -> dict | None:
 
 
 async def _next_creator_number(db: aiosqlite.Connection, user_id: int) -> int:
+    """Нумерация только среди открытых задач (архив не учитывается)."""
     cursor = await db.execute(
-        "SELECT COALESCE(MAX(creator_number), 0) FROM tasks WHERE from_user_id=?",
+        """SELECT COALESCE(MAX(creator_number), 0) FROM tasks
+           WHERE from_user_id=? AND status='open'""",
         (user_id,),
     )
     row = await cursor.fetchone()
@@ -481,7 +483,8 @@ async def _next_creator_number(db: aiosqlite.Connection, user_id: int) -> int:
 
 async def _next_assignee_number(db: aiosqlite.Connection, user_id: int) -> int:
     cursor = await db.execute(
-        "SELECT COALESCE(MAX(assignee_number), 0) FROM tasks WHERE assignee_user_id=?",
+        """SELECT COALESCE(MAX(assignee_number), 0) FROM tasks
+           WHERE assignee_user_id=? AND status='open'""",
         (user_id,),
     )
     row = await cursor.fetchone()
@@ -802,6 +805,15 @@ async def get_task(task_id: int) -> dict | None:
         cursor = await db.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
         row = await cursor.fetchone()
         return dict(row) if row else None
+
+
+async def delete_task(task_id: int) -> bool:
+    """Полное удаление задачи (в т.ч. из архива) и связанных уведомлений."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        await db.execute("DELETE FROM notifications WHERE task_id=?", (task_id,))
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 # ─────────────────────────── УВЕДОМЛЕНИЯ ────────────────────────

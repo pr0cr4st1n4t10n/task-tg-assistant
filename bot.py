@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 
 import notion_db as db
 from analyzer import analyze_message
+from premium_emoji import PE, e, ib
 
 load_dotenv()
 
@@ -236,16 +237,17 @@ async def send_alias_invite(message: Message, alias: dict) -> None:
     display = alias["display_name"]
     link = alias_join_link(alias["join_token"])
     linked = alias.get("linked_user_id")
-    status = "✅ уже подключён" if linked else "⏳ ждёт подключения"
+    status = f"{e(PE.CHECK)} уже подключён" if linked else f"{e(PE.CLOCK)} ждёт подключения"
     share_text = alias_share_text(display)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
-            text="📤 Выбрать контакт и отправить",
+            text="Выбрать контакт и отправить",
             url=telegram_share_url(link, share_text),
+            icon_custom_emoji_id=PE.SEND,
         ),
     ]])
     await message.answer(
-        f"👤 Участник <b>{display}</b> ({status})\n\n"
+        f"{e(PE.PROFILE)} Участник <b>{display}</b> ({status})\n\n"
         f"Приглашение — присоединиться к задачам как «<b>{display}</b>»:\n"
         f"<a href=\"{link}\">{link}</a>\n\n"
         "Нажмите кнопку ниже — Telegram предложит выбрать чат "
@@ -318,36 +320,36 @@ def task_display_no(task: dict, viewer_id: int | None) -> int:
 
 
 def _btn_back_menu() -> InlineKeyboardButton:
-    return InlineKeyboardButton(text="◀️ Меню", callback_data="menu_main")
+    return ib("Меню", "menu_main", PE.BACK)
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📋 Мои задачи", callback_data="menu_tasks_personal"),
-            InlineKeyboardButton(text="👥 С людьми", callback_data="menu_tasks_shared"),
+            ib("Мои задачи", "menu_tasks_personal", PE.FILE),
+            ib("С людьми", "menu_tasks_shared", PE.PEOPLE),
         ],
         [
-            InlineKeyboardButton(text="➕ Своя задача", callback_data="menu_add_personal"),
-            InlineKeyboardButton(text="➕ С участником", callback_data="menu_add_shared"),
+            ib("Своя задача", "menu_add_personal", PE.ADD_TEXT),
+            ib("С участником", "menu_add_shared", PE.PERSON_OK),
         ],
         [
-            InlineKeyboardButton(text="🚨 Просроченные", callback_data="menu_overdue"),
-            InlineKeyboardButton(text="🗄 Архив", callback_data="menu_archive"),
+            ib("Просроченные", "menu_overdue", PE.TIME_PAST),
+            ib("Архив", "menu_archive", PE.BOX),
         ],
         [
-            InlineKeyboardButton(text="👤 Участники", callback_data="menu_users"),
-            InlineKeyboardButton(text="🔔 Уведомления", callback_data="menu_notifications"),
+            ib("Участники", "menu_users", PE.PROFILE),
+            ib("Уведомления", "menu_notifications", PE.BELL),
         ],
-        [InlineKeyboardButton(text="❓ Как добавить в чате", callback_data="menu_help")],
+        [ib("Как добавить в чате", "menu_help", PE.INFO)],
     ])
 
 
 def archive_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📋 Мои", callback_data="menu_archive_personal"),
-            InlineKeyboardButton(text="👥 С людьми", callback_data="menu_archive_shared"),
+            ib("Мои", "menu_archive_personal", PE.FILE),
+            ib("С людьми", "menu_archive_shared", PE.PEOPLE),
         ],
         [_btn_back_menu()],
     ])
@@ -356,8 +358,8 @@ def archive_menu_keyboard() -> InlineKeyboardMarkup:
 def overdue_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📋 Мои", callback_data="menu_overdue_personal"),
-            InlineKeyboardButton(text="👥 С людьми", callback_data="menu_overdue_shared"),
+            ib("Мои", "menu_overdue_personal", PE.FILE),
+            ib("С людьми", "menu_overdue_shared", PE.PEOPLE),
         ],
         [_btn_back_menu()],
     ])
@@ -372,49 +374,71 @@ def tasks_keyboard(
     buttons = []
     for t in tasks:
         num = task_display_no(t, viewer_id)
-        buttons.append([InlineKeyboardButton(
-            text=f"✅ #{num} выполнено",
-            callback_data=f"done_task:{t['id']}",
-        )])
+        buttons.append([ib(f"#{num} выполнено", f"done_task:{t['id']}", PE.CHECK)])
     if with_menu:
         buttons.append([_btn_back_menu()])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def archive_keyboard(tasks: list[dict], archive_kind: str) -> InlineKeyboardMarkup:
+    """Кнопки удаления для архива (archive_kind: personal | shared)."""
+    buttons: list[list[InlineKeyboardButton]] = []
+    for i, t in enumerate(tasks, 1):
+        buttons.append([
+            ib(f"Удалить #{i}", f"del_task:{t['id']}:{archive_kind}", PE.TRASH),
+        ])
+    buttons.append([ib("К архиву", "menu_archive", PE.BACK)])
+    buttons.append([_btn_back_menu()])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def archive_delete_confirm_keyboard(task_id: int, archive_kind: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            ib("Удалить", f"del_task_ok:{task_id}:{archive_kind}", PE.CHECK),
+            ib("Отмена", f"del_task_no:{archive_kind}", PE.CROSS),
+        ],
+    ])
+
+
 def format_tasks_list(
     tasks: list[dict],
-    title: str = "📋 <b>Открытые задачи:</b>",
+    title: str | None = None,
     viewer_id: int | None = None,
 ) -> str:
     if not tasks:
-        return "📭 Открытых задач нет"
-    lines = [f"{title}\n"]
+        return f"{e(PE.BOX)} Открытых задач нет"
+    head = title or f"{e(PE.FILE)} <b>Открытые задачи:</b>"
+    lines = [f"{head}\n"]
     for t in tasks:
         num = task_display_no(t, viewer_id)
         added = fmt_date(t.get("added_at"))
-        deadline = f" · ⏰ до {fmt_date(t['deadline'])}" if t.get("deadline") else ""
-        reminder = f" · 🔔 напомнить в {fmt_datetime(t.get('reminder_at'))}" if t.get("reminder_at") else ""
-        assignee = f" · 🎯 {t['assignee_label']}" if t.get("assignee_label") else ""
+        deadline = f" · {e(PE.CLOCK)} до {fmt_date(t['deadline'])}" if t.get("deadline") else ""
+        reminder = (
+            f" · {e(PE.BELL)} напомнить в {fmt_datetime(t.get('reminder_at'))}"
+            if t.get("reminder_at") else ""
+        )
+        assignee = f" · {e(PE.TAG)} {t['assignee_label']}" if t.get("assignee_label") else ""
         lines.append(
             f"<b>#{num}</b> {t['text']}\n"
-            f"    👤 {t['from_user']}{assignee}{deadline}{reminder}\n"
-            f"    💬 {t['chat_title']} · 📅 {added}"
+            f"    {e(PE.PROFILE)} {t['from_user']}{assignee}{deadline}{reminder}\n"
+            f"    {e(PE.WRITE)} {t['chat_title']} · {e(PE.CALENDAR)} {added}"
         )
     return "\n\n".join(lines)
 
 
 def format_archive_list(tasks: list[dict], viewer_id: int | None = None) -> str:
+    """В архиве своя нумерация #1, #2… — не смешивается с открытыми задачами."""
     if not tasks:
-        return "📭 Архив пуст"
-    lines = ["🗄 <b>Архив задач:</b>\n"]
-    for t in tasks:
-        num = task_display_no(t, viewer_id)
+        return f"{e(PE.BOX)} Архив пуст"
+    lines = [f"{e(PE.BOX)} <b>Архив задач:</b>\n"]
+    for i, t in enumerate(tasks, 1):
         closed = fmt_date(t.get("closed_at") or t.get("added_at"))
-        deadline = f" · ⏰ {fmt_date(t['deadline'])}" if t.get("deadline") else ""
+        deadline = f" · {e(PE.CLOCK)} {fmt_date(t['deadline'])}" if t.get("deadline") else ""
         lines.append(
-            f"<b>#{num}</b> {t['text']}\n"
-            f"    👤 {t['from_user']}{deadline}\n"
-            f"    ✅ закрыто {closed}"
+            f"<b>#{i}</b> {t['text']}\n"
+            f"    {e(PE.PROFILE)} {t['from_user']}{deadline}\n"
+            f"    {e(PE.CHECK)} закрыто {closed}"
         )
     return "\n\n".join(lines)
 
@@ -423,20 +447,14 @@ def users_list_keyboard(aliases: list[dict]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for a in aliases:
         label = a["display_name"]
-        if len(label) > 18:
-            label = label[:17] + "…"
+        if len(label) > 22:
+            label = label[:21] + "…"
         rows.append([
-            InlineKeyboardButton(
-                text=f"📨 {label}",
-                callback_data=f"user_invite:{a['id']}",
-            ),
-            InlineKeyboardButton(
-                text="🗑",
-                callback_data=f"user_del:{a['id']}",
-            ),
+            ib(label, f"user_invite:{a['id']}", PE.SEND),
+            ib("Удалить", f"user_del:{a['id']}", PE.TRASH),
         ])
     rows.append([
-        InlineKeyboardButton(text="➕ Добавить", callback_data="users_add"),
+        ib("Добавить", "users_add", PE.ADD_TEXT),
         _btn_back_menu(),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -445,19 +463,50 @@ def users_list_keyboard(aliases: list[dict]) -> InlineKeyboardMarkup:
 def users_delete_confirm_keyboard(alias_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Удалить", callback_data=f"user_del_ok:{alias_id}"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="menu_users"),
+            ib("Удалить", f"user_del_ok:{alias_id}", PE.CHECK),
+            ib("Отмена", "menu_users", PE.CROSS),
         ],
     ])
 
 
 MAIN_MENU_TEXT = (
-    "👋 <b>TaskManager</b>\n\n"
+    f"{e(PE.SMILE)} <b>TaskManager</b>\n\n"
     "Выберите действие кнопкой ниже.\n\n"
-    "• <b>Мои задачи</b> — без участников\n"
-    "• <b>С людьми</b> — с указанием участника (<code>с имя</code>)\n"
-    "• В переписке: <code>@бот текст завтра в 17:00</code>"
+    f"• <b>Мои задачи</b> — без участников\n"
+    f"• <b>С людьми</b> — с указанием участника (<code>с имя</code>)\n"
+    f"• В переписке: <code>@taskFaster_bot текст завтра в 17:00</code>"
 )
+
+
+async def show_archive_list(
+    message: Message,
+    user_id: int,
+    archive_kind: str,
+    *,
+    edit: bool = False,
+) -> None:
+    if archive_kind == "personal":
+        tasks = await db.get_archived_personal_for_user(user_id)
+        empty = f"{e(PE.BOX)} Архив своих задач пуст"
+    else:
+        tasks = await db.get_archived_shared_for_user(user_id)
+        empty = f"{e(PE.BOX)} Архив задач с участниками пуст"
+    if not tasks:
+        text = empty
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [ib("К архиву", "menu_archive", PE.BACK)],
+            [_btn_back_menu()],
+        ])
+    else:
+        text = format_archive_list(tasks, viewer_id=user_id)
+        kb = archive_keyboard(tasks, archive_kind)
+    if edit:
+        try:
+            await message.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await message.answer(text, reply_markup=kb)
 
 
 async def show_main_menu(message: Message, edit: bool = False) -> None:
@@ -478,8 +527,10 @@ async def show_task_list(
     viewer_id: int,
     *,
     edit: bool = False,
-    empty_hint: str = "📭 Задач нет",
+    empty_hint: str | None = None,
 ) -> None:
+    if empty_hint is None:
+        empty_hint = f"{e(PE.BOX)} Задач нет"
     if not tasks:
         text = f"{empty_hint}\n\nСоздайте через меню или inline в чате."
         kb = InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]])
@@ -500,21 +551,21 @@ async def send_users_list(message: Message, edit: bool = False) -> None:
     aliases = await db.list_user_aliases(owner_id)
     if not aliases:
         text = (
-            "👤 <b>Участники</b>\n\n"
+            f"{e(PE.PEOPLE)} <b>Участники</b>\n\n"
             "Добавьте человека — потом в задаче укажите <code>с имя</code>.\n"
             "Пример в чате:\n"
-            "<code>@бот встреча завтра в 17:00 с имя</code>"
+            f"<code>@{_bot_username or 'taskFaster_bot'} встреча завтра в 17:00 с имя</code>"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="➕ Добавить", callback_data="users_add"),
+            ib("Добавить", "users_add", PE.ADD_TEXT),
             _btn_back_menu(),
         ]])
     else:
-        lines = ["👤 <b>Ваши участники:</b>\n"]
+        lines = [f"{e(PE.PEOPLE)} <b>Ваши участники:</b>\n"]
         for a in aliases:
-            st = "✅ подключён" if a.get("linked_user_id") else "⏳ ждёт"
+            st = f"{e(PE.CHECK)} подключён" if a.get("linked_user_id") else f"{e(PE.CLOCK)} ждёт"
             lines.append(f"• <b>{a['display_name']}</b> — {st}")
-        lines.append("\n📨 пригласить · 🗑 удалить")
+        lines.append(f"\n{e(PE.SEND)} пригласить · {e(PE.TRASH)} удалить")
         text = "\n".join(lines)
         kb = users_list_keyboard(aliases)
     if edit and message.reply_markup:
@@ -528,12 +579,12 @@ async def send_users_list(message: Message, edit: bool = False) -> None:
 
 def format_notifications_list(notifications: list[dict]) -> str:
     if not notifications:
-        return "🔔 Новых уведомлений нет"
-    lines = ["🔔 <b>Твои уведомления:</b>\n"]
+        return f"{e(PE.BELL)} Новых уведомлений нет"
+    lines = [f"{e(PE.BELL)} <b>Твои уведомления:</b>\n"]
     for i, n in enumerate(notifications, 1):
         created = fmt_date(n.get("created_at"))
-        unread = " 🔵" if not n.get("is_read") else ""
-        lines.append(f"<b>#{i}</b>{unread} {n['text']}\n    📅 {created}")
+        unread = f" {e(PE.EYE)}" if not n.get("is_read") else ""
+        lines.append(f"<b>#{i}</b>{unread} {n['text']}\n    {e(PE.CALENDAR)} {created}")
     return "\n\n".join(lines)
 
 
@@ -864,14 +915,16 @@ def _task_card(
         msg += f"\n\n👤 Подключить «{alias['display_name']}»: {link}"
         share_text = alias_share_text(alias["display_name"])
         buttons.append([InlineKeyboardButton(
-            text="🔔 Подключить участника",
+            text="Подключить участника",
             url=telegram_share_url(link, share_text),
+            icon_custom_emoji_id=PE.LINK,
         )])
     elif notify_token and _bot_username:
         msg += f"\n\n🔔 Собеседник: t.me/{_bot_username}?start=notify_{notify_token}"
         buttons.append([InlineKeyboardButton(
-            text="🔔 Подписаться на уведомления",
+            text="Подписаться на уведомления",
             url=f"https://t.me/{_bot_username}?start=notify_{notify_token}",
+            icon_custom_emoji_id=PE.BELL,
         )])
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
@@ -957,13 +1010,13 @@ def command_args(message: Message) -> str:
 def help_text() -> str:
     bot = _bot_username or "taskFaster_bot"
     return (
-        "❓ <b>Как добавить задачу</b>\n\n"
+        f"{e(PE.INFO)} <b>Как добавить задачу</b>\n\n"
         "<b>В чате с человеком или в группе:</b>\n"
         f"<code>@{bot} текст завтра в 17:00</code>\n"
         "→ нажмите на карточку <b>над полем ввода</b>\n\n"
-        "<b>С участником</b> (сначала «👤 Участники»):\n"
+        f"<b>С участником</b> (сначала «{e(PE.PROFILE)} Участники»):\n"
         f"<code>@{bot} встреча завтра в 17:00 с имя</code>\n\n"
-        "<b>Время (Москва):</b>\n"
+        f"<b>Время (Москва):</b>\n"
         "• <code>завтра в 19:00</code>\n"
         "• <code>сегодня в 15:30</code>\n"
         "• <code>в 15:30</code>\n"
@@ -991,18 +1044,18 @@ async def create_task_from_text(
     )
     if personal_only and (alias or assignee_err):
         await message.answer(
-            "⚠️ Это «своя» задача — без участника.\n"
-            "Уберите <code>с имя</code> из текста или нажните «➕ С участником».",
+            f"{e(PE.INFO)} Это «своя» задача — без участника.\n"
+            f"Уберите <code>с имя</code> из текста или нажмите «{e(PE.PERSON_OK)} С участником».",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]),
         )
         return
     if assignee_err:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👤 Участники", callback_data="menu_users")],
+            [ib("Участники", "menu_users", PE.PROFILE)],
             [_btn_back_menu()],
         ])
         await message.answer(
-            f"⚠️ Участник «{assignee_err['name']}» не найден.\n"
+            f"{e(PE.INFO)} Участник «{assignee_err['name']}» не найден.\n"
             "Добавьте в разделе «Участники».",
             reply_markup=kb,
         )
@@ -1018,19 +1071,23 @@ async def create_task_from_text(
             assignee_label=assignee_label,
             alias=alias,
         )
-        deadline_s = f" · ⏰ {fmt_date(deadline)}" if deadline else ""
-        reminder = f" · 🔔 {fmt_datetime(reminder_at)}" if reminder_at else ""
-        who = f" · 🎯 {assignee_label}" if assignee_label else ""
+        deadline_s = f" · {e(PE.CLOCK)} {fmt_date(deadline)}" if deadline else ""
+        reminder = f" · {e(PE.BELL)} {fmt_datetime(reminder_at)}" if reminder_at else ""
+        who = f" · {e(PE.TAG)} {assignee_label}" if assignee_label else ""
         task = await db.get_task(task_id)
         num = task_display_no(task, user.id) if task else task_id
-        kind = "👥" if assignee_label else "📋"
+        kind = e(PE.PEOPLE) if assignee_label else e(PE.FILE)
         await message.answer(
-            f"✅ {kind} Задача #{num} сохранена{who}{deadline_s}{reminder}\n📝 {task_text}",
+            f"{e(PE.CHECK)} {kind} Задача #{num} сохранена{who}{deadline_s}{reminder}\n"
+            f"{e(PE.PENCIL)} {task_text}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]),
         )
     except Exception:
         log.exception("Error saving task from message")
-        await message.answer("❌ Не удалось сохранить задачу", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]))
+        await message.answer(
+            f"{e(PE.CROSS)} Не удалось сохранить задачу",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]),
+        )
 
 
 @dp.message(Command("menu"))
@@ -1044,7 +1101,7 @@ async def cmd_task(message: Message) -> None:
     if not text:
         _pending_task_input[message.from_user.id] = "shared"
         await message.answer(
-            "✏️ Опишите задачу одним сообщением.\n"
+            f"{e(PE.PENCIL)} Опишите задачу одним сообщением.\n"
             "Для участника добавьте в конце: <code>с имя</code>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]),
         )
@@ -1164,11 +1221,11 @@ async def cmd_tasks(message: Message) -> None:
         await show_main_menu(message)
         return
     await message.answer(
-        "📋 Задачи этого чата — выберите тип:",
+        f"{e(PE.FILE)} Задачи этого чата — выберите тип:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="📋 Мои", callback_data=f"scope_tasks_p:{message.chat.id}"),
-                InlineKeyboardButton(text="👥 С людьми", callback_data=f"scope_tasks_s:{message.chat.id}"),
+                ib("Мои", f"scope_tasks_p:{message.chat.id}", PE.FILE),
+                ib("С людьми", f"scope_tasks_s:{message.chat.id}", PE.PEOPLE),
             ],
             [_btn_back_menu()],
         ]),
@@ -1180,9 +1237,15 @@ async def cmd_archive(message: Message) -> None:
     user_id = message.from_user.id
     await touch_scope(scope_from_message(message), chat_title(message), user_id)
     if _is_private_bot_chat(message):
-        await message.answer("🗄 <b>Архив</b> — выберите:", reply_markup=archive_menu_keyboard())
+        await message.answer(
+            f"{e(PE.BOX)} <b>Архив</b> — выберите:",
+            reply_markup=archive_menu_keyboard(),
+        )
         return
-    await message.answer("🗄 Архив чата:", reply_markup=archive_menu_keyboard())
+    await message.answer(
+        f"{e(PE.BOX)} Архив чата:",
+        reply_markup=archive_menu_keyboard(),
+    )
 
 
 @dp.message(Command("notifications"))
@@ -1191,7 +1254,10 @@ async def cmd_notifications(message: Message) -> None:
     await touch_scope(scope_from_message(message), chat_title(message), user_id)
     notifications = await db.get_user_notifications(user_id)
     if not notifications:
-        await message.answer("🔔 Уведомлений нет", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]))
+        await message.answer(
+            f"{e(PE.BELL)} Уведомлений нет",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]),
+        )
         return
     await message.answer(
         format_notifications_list(notifications),
@@ -1205,9 +1271,15 @@ async def cmd_overdue(message: Message) -> None:
     user_id = message.from_user.id
     await touch_scope(scope_from_message(message), chat_title(message), user_id)
     if _is_private_bot_chat(message):
-        await message.answer("🚨 <b>Просроченные</b> — выберите:", reply_markup=overdue_menu_keyboard())
+        await message.answer(
+            f"{e(PE.TIME_PAST)} <b>Просроченные</b> — выберите:",
+            reply_markup=overdue_menu_keyboard(),
+        )
         return
-    await message.answer("🚨 Просроченные:", reply_markup=overdue_menu_keyboard())
+    await message.answer(
+        f"{e(PE.TIME_PAST)} Просроченные:",
+        reply_markup=overdue_menu_keyboard(),
+    )
 
 
 @dp.message(F.text & F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE}))
@@ -1220,7 +1292,10 @@ async def handle_chat_activity(message: Message) -> None:
         mode = _pending_task_input.pop(uid)
         text = (message.text or "").strip()
         if not text or text.startswith("/"):
-            await message.answer("❌ Напишите текст задачи.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]))
+            await message.answer(
+                f"{e(PE.CROSS)} Напишите текст задачи.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]),
+            )
             return
         await create_task_from_text(message, text, personal_only=(mode == "personal"))
         return
@@ -1272,8 +1347,12 @@ async def cb_menu_tasks_personal(callback: CallbackQuery) -> None:
     uid = callback.from_user.id
     tasks = await db.get_personal_tasks_for_user(uid)
     await show_task_list(
-        callback.message, tasks, "📋 <b>Мои задачи</b> (без участников)", uid,
-        edit=True, empty_hint="📭 Своих задач нет",
+        callback.message,
+        tasks,
+        f"{e(PE.FILE)} <b>Мои задачи</b> (без участников)",
+        uid,
+        edit=True,
+        empty_hint=f"{e(PE.BOX)} Своих задач нет",
     )
 
 
@@ -1283,8 +1362,12 @@ async def cb_menu_tasks_shared(callback: CallbackQuery) -> None:
     uid = callback.from_user.id
     tasks = await db.get_shared_tasks_for_user(uid)
     await show_task_list(
-        callback.message, tasks, "👥 <b>Задачи с участниками</b>", uid,
-        edit=True, empty_hint="📭 Задач с участниками нет",
+        callback.message,
+        tasks,
+        f"{e(PE.PEOPLE)} <b>Задачи с участниками</b>",
+        uid,
+        edit=True,
+        empty_hint=f"{e(PE.BOX)} Задач с участниками нет",
     )
 
 
@@ -1293,7 +1376,7 @@ async def cb_menu_add_personal(callback: CallbackQuery) -> None:
     _pending_task_input[callback.from_user.id] = "personal"
     await callback.answer()
     await callback.message.answer(
-        "✏️ <b>Своя задача</b>\n\n"
+        f"{e(PE.PENCIL)} <b>Своя задача</b>\n\n"
         "Напишите одним сообщением, например:\n"
         "<code>купить молоко завтра в 18:00</code>\n\n"
         "Без <code>с имя</code> в конце.",
@@ -1306,12 +1389,12 @@ async def cb_menu_add_shared(callback: CallbackQuery) -> None:
     _pending_task_input[callback.from_user.id] = "shared"
     await callback.answer()
     await callback.message.answer(
-        "✏️ <b>Задача с участником</b>\n\n"
+        f"{e(PE.PENCIL)} <b>Задача с участником</b>\n\n"
         "Напишите задачу с именем в конце:\n"
         "<code>встреча завтра в 17:00 с имя</code>\n\n"
-        "Участника добавьте в «👤 Участники», если ещё нет.",
+        f"Участника добавьте в «{e(PE.PROFILE)} Участники», если ещё нет.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👤 Участники", callback_data="menu_users")],
+            [ib("Участники", "menu_users", PE.PROFILE)],
             [_btn_back_menu()],
         ]),
     )
@@ -1321,7 +1404,7 @@ async def cb_menu_add_shared(callback: CallbackQuery) -> None:
 async def cb_menu_archive(callback: CallbackQuery) -> None:
     await callback.answer()
     await callback.message.edit_text(
-        "🗄 <b>Архив</b> — выберите раздел:",
+        f"{e(PE.BOX)} <b>Архив</b> — выберите раздел:",
         reply_markup=archive_menu_keyboard(),
     )
 
@@ -1329,24 +1412,16 @@ async def cb_menu_archive(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "menu_archive_personal")
 async def cb_menu_archive_personal(callback: CallbackQuery) -> None:
     await callback.answer()
-    uid = callback.from_user.id
-    tasks = await db.get_archived_personal_for_user(uid)
-    text = format_archive_list(tasks, viewer_id=uid) if tasks else "📭 Архив своих задач пуст"
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]),
+    await show_archive_list(
+        callback.message, callback.from_user.id, "personal", edit=True,
     )
 
 
 @dp.callback_query(F.data == "menu_archive_shared")
 async def cb_menu_archive_shared(callback: CallbackQuery) -> None:
     await callback.answer()
-    uid = callback.from_user.id
-    tasks = await db.get_archived_shared_for_user(uid)
-    text = format_archive_list(tasks, viewer_id=uid) if tasks else "📭 Архив задач с участниками пуст"
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]),
+    await show_archive_list(
+        callback.message, callback.from_user.id, "shared", edit=True,
     )
 
 
@@ -1354,7 +1429,7 @@ async def cb_menu_archive_shared(callback: CallbackQuery) -> None:
 async def cb_menu_overdue(callback: CallbackQuery) -> None:
     await callback.answer()
     await callback.message.edit_text(
-        "🚨 <b>Просроченные</b> — выберите:",
+        f"{e(PE.TIME_PAST)} <b>Просроченные</b> — выберите:",
         reply_markup=overdue_menu_keyboard(),
     )
 
@@ -1363,15 +1438,17 @@ async def _show_overdue(callback: CallbackQuery, tasks: list[dict], title: str) 
     uid = callback.from_user.id
     if not tasks:
         await callback.message.edit_text(
-            f"✅ {title}: нет просроченных",
+            f"{e(PE.CHECK)} {title}: нет просроченных",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]),
         )
         return
-    lines = [f"🚨 <b>{title}</b> ({len(tasks)}):\n"]
+    lines = [f"{e(PE.TIME_PAST)} <b>{title}</b> ({len(tasks)}):\n"]
     for t in tasks:
         num = task_display_no(t, uid)
-        who = f" · 🎯 {t['assignee_label']}" if t.get("assignee_label") else ""
-        lines.append(f"<b>#{num}</b> {t['text']}{who}\n  ⏰ {fmt_date(t['deadline'])}")
+        who = f" · {e(PE.TAG)} {t['assignee_label']}" if t.get("assignee_label") else ""
+        lines.append(
+            f"<b>#{num}</b> {t['text']}{who}\n  {e(PE.CLOCK)} {fmt_date(t['deadline'])}"
+        )
     await callback.message.edit_text(
         "\n\n".join(lines),
         reply_markup=tasks_keyboard(tasks, viewer_id=uid),
@@ -1405,7 +1482,7 @@ async def cb_menu_notifications(callback: CallbackQuery) -> None:
     await callback.answer()
     if not notifications:
         await callback.message.edit_text(
-            "🔔 Уведомлений нет",
+            f"{e(PE.BELL)} Уведомлений нет",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn_back_menu()]]),
         )
         return
@@ -1431,8 +1508,12 @@ async def cb_scope_tasks_personal(callback: CallbackQuery) -> None:
     await callback.answer()
     tasks = await db.get_personal_tasks_for_scope(scope)
     await show_task_list(
-        callback.message, tasks, "📋 <b>Задачи чата</b> (без участников)",
-        callback.from_user.id, edit=True, empty_hint="📭 Нет своих задач в этом чате",
+        callback.message,
+        tasks,
+        f"{e(PE.FILE)} <b>Задачи чата</b> (без участников)",
+        callback.from_user.id,
+        edit=True,
+        empty_hint=f"{e(PE.BOX)} Нет своих задач в этом чате",
     )
 
 
@@ -1442,8 +1523,12 @@ async def cb_scope_tasks_shared(callback: CallbackQuery) -> None:
     await callback.answer()
     tasks = await db.get_shared_tasks_for_scope(scope)
     await show_task_list(
-        callback.message, tasks, "👥 <b>Задачи чата</b> (с участниками)",
-        callback.from_user.id, edit=True, empty_hint="📭 Нет задач с участниками",
+        callback.message,
+        tasks,
+        f"{e(PE.PEOPLE)} <b>Задачи чата</b> (с участниками)",
+        callback.from_user.id,
+        edit=True,
+        empty_hint=f"{e(PE.BOX)} Нет задач с участниками",
     )
 
 
@@ -1452,7 +1537,8 @@ async def cb_users_add(callback: CallbackQuery) -> None:
     _pending_add_user.add(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "✏️ <b>Новый участник</b>\n\nНапишите имя одним сообщением (как будете указывать в задаче после «с»).",
+        f"{e(PE.PENCIL)} <b>Новый участник</b>\n\n"
+        "Напишите имя одним сообщением (как будете указывать в задаче после «с»).",
     )
 
 
@@ -1482,7 +1568,7 @@ async def cb_user_del_ask(callback: CallbackQuery) -> None:
         return
     await callback.answer()
     await callback.message.edit_text(
-        f"🗑 Удалить участника <b>{alias['display_name']}</b>?",
+        f"{e(PE.TRASH)} Удалить участника <b>{alias['display_name']}</b>?",
         reply_markup=users_delete_confirm_keyboard(alias_id),
     )
 
@@ -1529,6 +1615,66 @@ async def cb_done_task(callback: CallbackQuery) -> None:
         ]
         new_kb = InlineKeyboardMarkup(inline_keyboard=new_rows) if new_rows else None
         await callback.message.edit_reply_markup(reply_markup=new_kb)
+
+
+@dp.callback_query(F.data.startswith("del_task:"))
+async def cb_del_task_ask(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    task_id = int(parts[1])
+    archive_kind = parts[2]
+    task = await db.get_task(task_id)
+    if not task or task.get("status") != "done":
+        await callback.answer("Задача не найдена", show_alert=True)
+        return
+    if not await ensure_task_access(callback.from_user.id, task):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_text(
+        f"{e(PE.TRASH)} Удалить задачу из архива?\n\n<b>{task['text']}</b>",
+        reply_markup=archive_delete_confirm_keyboard(task_id, archive_kind),
+    )
+
+
+@dp.callback_query(F.data.startswith("del_task_ok:"))
+async def cb_del_task_ok(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    task_id = int(parts[1])
+    archive_kind = parts[2]
+    task = await db.get_task(task_id)
+    if not task:
+        await callback.answer("Уже удалена", show_alert=True)
+        await show_archive_list(
+            callback.message, callback.from_user.id, archive_kind, edit=True,
+        )
+        return
+    if not await ensure_task_access(callback.from_user.id, task):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await db.delete_task(task_id)
+    try:
+        scheduler.remove_job(f"reminder_{task_id}")
+    except Exception:
+        pass
+    await callback.answer("Удалено")
+    await show_archive_list(
+        callback.message, callback.from_user.id, archive_kind, edit=True,
+    )
+
+
+@dp.callback_query(F.data.startswith("del_task_no:"))
+async def cb_del_task_no(callback: CallbackQuery) -> None:
+    archive_kind = callback.data.split(":", 1)[1]
+    await callback.answer()
+    await show_archive_list(
+        callback.message, callback.from_user.id, archive_kind, edit=True,
+    )
 
 
 # ════════════════════════════════════════════════════════════════
