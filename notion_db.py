@@ -386,6 +386,26 @@ async def list_user_aliases(owner_id: int) -> list[dict]:
         return [_alias_row(r) for r in rows]
 
 
+async def delete_user_alias(owner_id: int, name: str) -> dict | None:
+    """Удаляет участника. Возвращает удалённую запись или None."""
+    key = normalize_alias_key(name)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, owner_id, alias_key, display_name, linked_user_id, join_token, created_at "
+            "FROM user_aliases WHERE owner_id=? AND alias_key=?",
+            (owner_id, key),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        await db.execute(
+            "DELETE FROM user_aliases WHERE owner_id=? AND alias_key=?",
+            (owner_id, key),
+        )
+        await db.commit()
+        return _alias_row(row)
+
+
 # ─────────────────────────── ЗАДАЧИ ─────────────────────────────
 
 async def add_task(

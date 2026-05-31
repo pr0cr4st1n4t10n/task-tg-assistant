@@ -85,13 +85,19 @@ def now_moscow() -> datetime:
 
 
 def get_chat_instance(obj) -> str | None:
-    """chat_instance есть у ChosenInlineResult (extra), но не у InlineQuery."""
-    value = getattr(obj, "chat_instance", None)
+    """chat_instance только у ChosenInlineResult, не у InlineQuery."""
+    try:
+        value = getattr(obj, "chat_instance", None)
+    except AttributeError:
+        value = None
     if value is not None:
         return str(value)
     extra = getattr(obj, "model_extra", None) or {}
-    raw = extra.get("chat_instance")
-    return str(raw) if raw is not None else None
+    if isinstance(extra, dict):
+        raw = extra.get("chat_instance")
+        if raw is not None:
+            return str(raw)
+    return None
 
 
 def remember_private_chat(user_id: int, scope: str, title: str) -> None:
@@ -832,7 +838,7 @@ async def reply_users_list(message: Message) -> None:
         st = "✅ подключён" if a.get("linked_user_id") else "⏳ ждёт подключения"
         lines.append(f"• <b>{a['display_name']}</b> — {st}")
     lines.append("\nДобавить: <code>/addusers имя</code>")
-    lines.append("Повторить приглашение: <code>/addusers имя</code>")
+    lines.append("Удалить: <code>/delusers имя</code>")
     await message.answer("\n".join(lines))
 
 
@@ -852,6 +858,26 @@ async def cmd_addusers(message: Message) -> None:
         return
     alias = await db.create_user_alias(message.from_user.id, name)
     await send_alias_invite(message, alias)
+
+
+@dp.message(Command("delusers", "deluser", "rmuser"))
+async def cmd_delusers(message: Message) -> None:
+    name = command_args(message).strip()
+    if not name:
+        await message.answer(
+            "🗑 Укажите имя участника:\n"
+            "<code>/delusers женя</code>\n\n"
+            "Список: <code>/users</code>",
+        )
+        return
+    removed = await db.delete_user_alias(message.from_user.id, name)
+    if not removed:
+        await message.answer(f"❌ Участник «{name}» не найден. Список: /users")
+        return
+    await message.answer(
+        f"🗑 Участник <b>{removed['display_name']}</b> удалён.\n"
+        "Новые задачи с этим именем создавать нельзя, пока не добавите снова через /addusers.",
+    )
 
 
 @dp.business_connection()
@@ -932,7 +958,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         "Задачи привязаны к <b>этому чату</b> — у каждой переписки свой список.\n\n"
         "<b>Команды:</b>\n"
         "/tasks — открытые задачи\n"
-        "/users — ваши участники (женя и др.)\n"
+        "/users — участники · /delusers имя — удалить\n"
         "/archive — архив\n"
         "/notifications — уведомления\n"
         "/overdue — просроченные"
