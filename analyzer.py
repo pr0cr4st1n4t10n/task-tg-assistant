@@ -4,6 +4,13 @@
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+MOSCOW = ZoneInfo("Europe/Moscow")
+
+
+def _now() -> datetime:
+    return datetime.now(MOSCOW).replace(tzinfo=None)
 
 TASK_PATTERNS = [
     r"(?:сделай|сделайте|сделать)\s+(.{5,80})",
@@ -24,6 +31,8 @@ TASK_PATTERNS = [
     r"(?:куплю|закажу|оплачу)\s+(.{3,60})",
     r"(?:проверю|посмотрю|уточню)\s+(.{3,60})",
     r"(?:договорились|ок|окей|хорошо)[,\s]+(.{3,60})",
+    r"(?:завтра|послезавтра|в понедельник|во вторник|в среду|в четверг|"
+    r"в пятницу|в субботу|в воскресенье)\s+(.{3,60})",
     r"(.{3,60})\s+(?:завтра|послезавтра|в понедельник|во вторник|в среду|"
     r"в четверг|в пятницу|в субботу|в воскресенье)",
     r"(.{3,60})\s+(?:на следующей неделе|на этой неделе)",
@@ -36,8 +45,8 @@ TASK_PATTERNS = [
 ]
 
 DEADLINE_PATTERNS = {
-    "завтра": lambda: (datetime.now() + timedelta(days=1)).date().isoformat(),
-    "послезавтра": lambda: (datetime.now() + timedelta(days=2)).date().isoformat(),
+    "завтра": lambda: (_now() + timedelta(days=1)).date().isoformat(),
+    "послезавтра": lambda: (_now() + timedelta(days=2)).date().isoformat(),
     "в понедельник": lambda: _next_weekday(0),
     "во вторник": lambda: _next_weekday(1),
     "в среду": lambda: _next_weekday(2),
@@ -45,12 +54,12 @@ DEADLINE_PATTERNS = {
     "в пятницу": lambda: _next_weekday(4),
     "в субботу": lambda: _next_weekday(5),
     "в воскресенье": lambda: _next_weekday(6),
-    "на следующей неделе": lambda: (datetime.now() + timedelta(weeks=1)).date().isoformat(),
+    "на следующей неделе": lambda: (_now() + timedelta(weeks=1)).date().isoformat(),
 }
 
 
 def _next_weekday(weekday: int) -> str:
-    today = datetime.now()
+    today = _now()
     days_ahead = weekday - today.weekday()
     if days_ahead <= 0:
         days_ahead += 7
@@ -121,11 +130,11 @@ def _extract_deadline(text: str) -> str | None:
 
     m = re.search(r"через\s+(\d+)\s+(день|дня|дней)", text)
     if m:
-        return (datetime.now() + timedelta(days=int(m.group(1)))).date().isoformat()
+        return (_now() + timedelta(days=int(m.group(1)))).date().isoformat()
 
     m = re.search(r"через\s+(\d+)\s+(час|часа|часов)", text)
     if m:
-        return (datetime.now() + timedelta(hours=int(m.group(1)))).date().isoformat()
+        return (_now() + timedelta(hours=int(m.group(1)))).date().isoformat()
 
     return None
 

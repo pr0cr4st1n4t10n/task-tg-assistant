@@ -4,6 +4,7 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType, ParseMode
@@ -46,15 +47,25 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
-scheduler = AsyncIOScheduler(timezone="Asia/Yekaterinburg")
+scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+MOSCOW = ZoneInfo("Europe/Moscow")
 
-# user_id -> (scope, chat_title): контекст последнего inline-запроса
+# user_id -> (scope, chat_title): контекст последнего чата пользователя
 _inline_scope: dict[int, tuple[str, str]] = {}
+# chat_instance (из chosen_inline_result) -> (scope, chat_title)
+_chat_instance_scope: dict[str, tuple[str, str]] = {}
+# scope = chat_instance (нет числового chat_id) — в чат через API не отправить
+_opaque_scopes: set[str] = set()
 
 
 # ════════════════════════════════════════════════════════════════
 #  ХЕЛПЕРЫ
 # ════════════════════════════════════════════════════════════════
+
+def now_moscow() -> datetime:
+    """Текущее время в Москве (naive, для сравнений и планировщика)."""
+    return datetime.now(MOSCOW).replace(tzinfo=None)
+
 
 def fmt_date(iso: str | None) -> str:
     if not iso:
@@ -92,20 +103,13 @@ def parse_reminder_time(text: str) -> tuple[str | None, str]:
     - "через 2 часа"
     - "через 30 минут"
     """
-    now = datetime.now()
+    now = now_moscow()
     clean_text = text
     reminder_time = None
-    
-    # Проверяем на "завтра"
-    is_tomorrow = False
-    if re.search(r'\bзавтра\b', text, re.IGNORECASE):
-        is_tomorrow = True
-        clean_text = re.sub(r'\bзавтра\b', '', clean_text, flags=re.IGNORECASE).strip()
-    
-    # Проверяем на "сегодня"
-    if re.search(r'\bсегодня\b', text, re.IGNORECASE):
-        clean_text = re.sub(r'\bсегодня\b', '', clean_text, flags=re.IGNORECASE).strip()
-    
+
+    is_tomorrow = bool(re.search(r'\bзавтра\b', text, re.IGNORECASE))
+    is_today = bool(re.search(r'\bсегодня\b', text, re.IGNORECASE))
+
     # Формат: в 15:30 или в 15-30
     m = re.search(r'(?:в|время|во)\s+(\d{1,2})[:.-](\d{2})', clean_text, re.IGNORECASE)
     if m:
@@ -113,12 +117,16 @@ def parse_reminder_time(text: str) -> tuple[str | None, str]:
         base_date = now.date()
         if is_tomorrow:
             base_date += timedelta(days=1)
+        elif is_today:
+            pass
         reminder_time = datetime(base_date.year, base_date.month, base_date.day, hour, minute, 0)
-        if reminder_time <= now and not is_tomorrow:
+        if reminder_time <= now and not is_tomorrow and not is_today:
             reminder_time += timedelta(days=1)
+        clean_text = re.sub(r'\bзавтра\b', '', clean_text, flags=re.IGNORECASE).strip()
+        clean_text = re.sub(r'\bсегодня\b', '', clean_text, flags=re.IGNORECASE).strip()
         clean_text = re.sub(r'(?:в|время|во)\s+\d{1,2}[:.-]\d{2}', '', clean_text, flags=re.IGNORECASE).strip()
         return reminder_time.isoformat(), clean_text
-    
+
     # Формат: через X часов
     m = re.search(r'через\s+(\d+)\s+час(?:а|ов)?', clean_text, re.IGNORECASE)
     if m:
@@ -126,7 +134,7 @@ def parse_reminder_time(text: str) -> tuple[str | None, str]:
         reminder_time = now + timedelta(hours=hours)
         clean_text = re.sub(r'через\s+\d+\s+час(?:а|ов)?', '', clean_text, flags=re.IGNORECASE).strip()
         return reminder_time.isoformat(), clean_text
-    
+
     # Формат: через X минут
     m = re.search(r'через\s+(\d+)\s+минут(?:у|ы)?', clean_text, re.IGNORECASE)
     if m:
@@ -134,7 +142,8 @@ def parse_reminder_time(text: str) -> tuple[str | None, str]:
         reminder_time = now + timedelta(minutes=minutes)
         clean_text = re.sub(r'через\s+\d+\s+минут(?:у|ы)?', '', clean_text, flags=re.IGNORECASE).strip()
         return reminder_time.isoformat(), clean_text
-    
+
+    # «завтра» / «сегодня» без времени — не трогаем текст (дедлайн извлечёт analyzer)
     return None, clean_text
 
 
@@ -156,11 +165,12 @@ def chat_title(message: Message) -> str:
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         return message.chat.title or "Группа"
     if message.chat.type == ChatType.PRIVATE:
-        if message.from_user:
-            name = message.from_user.first_name or "Личка"
-            if message.from_user.last_name:
-                name += f" {message.from_user.last_name}"
-            return f"Чат с {name}"
+        name = message.chat.first_name or "Личка"
+        if message.chat.last_name:
+            name += f" {message.chat.last_name}"
+        if message.chat.username:
+            name += f" (@{message.chat.username})"
+        return f"Чат с {name}"
     return "Чат"
 
 
@@ -242,17 +252,52 @@ def format_notifications_list(notifications: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+def _private_peer_user_id(scope: str, creator_id: int) -> int | None:
+    """В личке scope = id собеседника; вернуть его, если это не автор задачи."""
+    if not is_telegram_chat(scope):
+        return None
+    peer_id = int(scope)
+    if peer_id > 0 and peer_id != creator_id:
+        return peer_id
+    return None
+
+
+async def resolve_scope_from_chat_instance(
+    chat_instance: str,
+    user_id: int,
+) -> tuple[str, str]:
+    if chat_instance in _chat_instance_scope:
+        return _chat_instance_scope[chat_instance]
+
+    if user_id in _inline_scope:
+        scope, title = _inline_scope[user_id]
+        _chat_instance_scope[chat_instance] = (scope, title)
+        return scope, title
+
+    last = await db.get_last_scope(user_id)
+    if last:
+        title = await scope_title(last, "Личный чат")
+        pair = (last, title)
+        _chat_instance_scope[chat_instance] = pair
+        return pair
+
+    title = "Личный чат"
+    pair = (chat_instance, title)
+    _chat_instance_scope[chat_instance] = pair
+    _opaque_scopes.add(chat_instance)
+    return pair
+
+
 async def resolve_inline_scope(user_id: int) -> tuple[str, str]:
     if user_id in _inline_scope:
         return _inline_scope[user_id]
 
     last = await db.get_last_scope(user_id)
     if last:
-        title = await scope_title(last)
+        title = await scope_title(last, "Чат")
         return last, title
 
-    scope = str(user_id)
-    return scope, f"Чат с {user_id}"
+    return str(user_id), "Личный чат (уточните: напишите боту из нужного чата или /task)"
 
 
 async def touch_scope(scope: str, title: str, user_id: int) -> None:
@@ -279,16 +324,20 @@ async def save_and_notify(
         f"📝 {text}"
     )
 
-    # Отправляем в чат, если это Telegram чат
-    if is_telegram_chat(scope):
+    posted_to_chat = False
+    if is_telegram_chat(scope) and scope not in _opaque_scopes:
         try:
             await bot.send_message(int(scope), notify_text)
+            posted_to_chat = True
         except Exception as e:
             log.warning(f"Cannot post to chat {scope}: {e}")
 
-    member_ids = await db.get_scope_user_ids(scope)
+    member_ids = list(await db.get_scope_user_ids(scope))
     if user_id not in member_ids:
         member_ids.append(user_id)
+    peer_id = _private_peer_user_id(scope, user_id)
+    if peer_id and peer_id not in member_ids:
+        member_ids.append(peer_id)
 
     short = f"📝 Новая задача #{task_id}: {text[:80]}"
     if deadline:
@@ -298,7 +347,7 @@ async def save_and_notify(
 
     for uid in member_ids:
         await db.add_notification(uid, scope, task_id, short)
-        if uid != user_id or not is_telegram_chat(scope):
+        if uid != user_id or not posted_to_chat:
             try:
                 await bot.send_message(uid, f"🔔 {short}\n💬 {chat_title_str}")
             except Exception:
@@ -307,7 +356,7 @@ async def save_and_notify(
     # Если есть напоминание, планируем его
     if reminder_at:
         reminder_dt = datetime.fromisoformat(reminder_at)
-        if reminder_dt > datetime.now():
+        if reminder_dt > now_moscow():
             scheduler.add_job(
                 send_reminder,
                 "date",
@@ -356,12 +405,10 @@ async def handle_inline(inline_query: InlineQuery) -> None:
     query = inline_query.query.strip()
     user = inline_query.from_user
     
-    log.info("Inline query uid=%s q=%r", user.id, query)
-    
-    # В inline_query нет информации о чате, сохраняем только user_id
-    # Реальный чат определится через контекст (последнее сообщение или chosen)
-    if user.id not in _inline_scope:
-        _inline_scope[user.id] = (str(user.id), f"Чат с {user.first_name}")
+    log.info(
+        "Inline query uid=%s chat_type=%s q=%r",
+        user.id, inline_query.chat_type, query,
+    )
 
     try:
         if not query:
@@ -438,18 +485,16 @@ async def handle_chosen(chosen: ChosenInlineResult) -> None:
         return
     user = chosen.from_user
     name = sender_name(user)
-    
-    # В вашей версии aiogram нет chat_instance у ChosenInlineResult
-    # Используем from_id как идентификатор пользователя, а контекст берем из _inline_scope
-    if user.id in _inline_scope:
-        scope, chat_title_str = _inline_scope[user.id]
+
+    chat_instance = getattr(chosen, "chat_instance", None)
+    if chat_instance:
+        scope, chat_title_str = await resolve_scope_from_chat_instance(str(chat_instance), user.id)
     else:
-        # Если контекста нет, используем личный чат пользователя
-        scope = str(user.id)
-        chat_title_str = f"Чат с {user.first_name}"
-    
-    # Сохраняем контекст
+        scope, chat_title_str = await resolve_inline_scope(user.id)
+
     _inline_scope[user.id] = (scope, chat_title_str)
+    if chat_instance:
+        _chat_instance_scope[str(chat_instance)] = (scope, chat_title_str)
     await touch_scope(scope, chat_title_str, user.id)
 
     # Извлекаем время напоминания и чистим текст
@@ -626,7 +671,6 @@ async def handle_chat_activity(message: Message) -> None:
     scope = scope_from_message(message)
     title = chat_title(message)
     await touch_scope(scope, title, message.from_user.id)
-    # Обновляем контекст для пользователя
     _inline_scope[message.from_user.id] = (scope, title)
 
 
