@@ -432,6 +432,50 @@ async def get_tasks(scope: str, only_open: bool = True) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+async def get_tasks_for_user(user_id: int, only_open: bool = True) -> list[dict]:
+    """Задачи, которые пользователь создал или на которые назначен исполнителем."""
+    status_filter = "AND status='open'" if only_open else ""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"""SELECT * FROM tasks
+                WHERE (from_user_id=? OR assignee_user_id=?)
+                {status_filter}
+                ORDER BY id DESC""",
+            (user_id, user_id),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_archived_for_user(user_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT * FROM tasks
+               WHERE (from_user_id=? OR assignee_user_id=?) AND status='done'
+               ORDER BY closed_at DESC, id DESC""",
+            (user_id, user_id),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_overdue_tasks_for_user(user_id: int) -> list[dict]:
+    today = date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT * FROM tasks
+               WHERE status='open' AND deadline IS NOT NULL AND deadline < ?
+               AND (from_user_id=? OR assignee_user_id=?)
+               ORDER BY deadline ASC""",
+            (today, user_id, user_id),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
 async def get_tasks_for_scopes(scopes: list[str], only_open: bool = True) -> list[dict]:
     if not scopes:
         return []
@@ -547,19 +591,15 @@ async def add_notification(user_id: int, scope: str, task_id: int, text: str) ->
 
 
 async def get_user_notifications(user_id: int, only_unread: bool = False) -> list[dict]:
-    scopes = await get_user_scopes(user_id)
-    if not scopes:
-        return []
-    placeholders = ",".join("?" * len(scopes))
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        query = f"""
+        query = """
             SELECT n.*, t.text AS task_text, t.deadline
             FROM notifications n
             LEFT JOIN tasks t ON t.id = n.task_id
-            WHERE n.user_id=? AND n.scope IN ({placeholders})
+            WHERE n.user_id=?
         """
-        params: list = [user_id, *scopes]
+        params: list = [user_id]
         if only_unread:
             query += " AND n.is_read=0"
         query += " ORDER BY n.created_at DESC LIMIT 50"

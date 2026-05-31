@@ -191,6 +191,11 @@ def alias_join_link(join_token: str) -> str:
     return f"https://t.me/{_bot_username}?start=join_{join_token}"
 
 
+def alias_share_text(display: str) -> str:
+    """Текст для t.me/share/url — без ссылки (она передаётся отдельно в url=)."""
+    return f"Присоединись к задачам как «{display}». Открой бота и нажми Start."
+
+
 async def split_assignee(text: str, owner_id: int) -> tuple[str, dict | None]:
     m = _ASSIGNEE_SUFFIX_RE.search(text)
     if not m:
@@ -224,10 +229,7 @@ async def send_alias_invite(message: Message, alias: dict) -> None:
     link = alias_join_link(alias["join_token"])
     linked = alias.get("linked_user_id")
     status = "✅ уже подключён" if linked else "⏳ ждёт подключения"
-    share_text = (
-        f"Присоединись к задачам как «{display}». "
-        f"Открой ссылку и нажми Start в боте:\n{link}"
-    )
+    share_text = alias_share_text(display)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
             text="📤 Выбрать контакт и отправить",
@@ -437,6 +439,28 @@ async def touch_scope(scope: str, title: str, user_id: int) -> None:
     await db.register_chat_user(scope, title, user_id)
 
 
+def dm_notify_recipients(
+    creator_id: int,
+    assignee_user_id: int | None,
+    posted_to_chat: bool,
+) -> list[int]:
+    """Кому слать личное уведомление: только автор (если не ушло в чат) и исполнитель."""
+    recipients: list[int] = []
+    if not posted_to_chat:
+        recipients.append(creator_id)
+    if assignee_user_id and assignee_user_id not in recipients:
+        recipients.append(assignee_user_id)
+    return recipients
+
+
+async def ensure_task_access(user_id: int, task: dict) -> bool:
+    if task["from_user_id"] == user_id:
+        return True
+    if task.get("assignee_user_id") == user_id:
+        return True
+    return task["scope"] in await db.get_user_scopes(user_id)
+
+
 async def save_and_notify(
     text: str,
     scope: str,
@@ -475,15 +499,6 @@ async def save_and_notify(
         except Exception as e:
             log.warning(f"Cannot post to chat {scope}: {e}")
 
-    member_ids = list(await db.get_scope_user_ids(scope))
-    if user_id not in member_ids:
-        member_ids.append(user_id)
-    peer_id = _private_peer_user_id(scope, user_id)
-    if peer_id and peer_id not in member_ids:
-        member_ids.append(peer_id)
-    if assignee_user_id and assignee_user_id not in member_ids:
-        member_ids.append(assignee_user_id)
-
     short = f"📝 Новая задача #{task_id}: {text[:80]}"
     if assignee_label:
         short += f" → {assignee_label}"
@@ -492,19 +507,16 @@ async def save_and_notify(
     if reminder_at:
         short += f" 🔔 в {fmt_datetime(reminder_at)}"
 
-    peer_notified = False
+    notify_uids = dm_notify_recipients(user_id, assignee_user_id, posted_to_chat)
     assignee_notified = False
-    for uid in member_ids:
+    for uid in notify_uids:
         await db.add_notification(uid, scope, task_id, short)
-        if uid != user_id or not posted_to_chat:
-            try:
-                await bot.send_message(uid, f"🔔 {short}\n💬 {chat_title_str}")
-                if peer_id and uid == peer_id:
-                    peer_notified = True
-                if assignee_user_id and uid == assignee_user_id:
-                    assignee_notified = True
-            except Exception:
-                pass
+        try:
+            await bot.send_message(uid, f"🔔 {short}\n💬 {chat_title_str}")
+            if assignee_user_id and uid == assignee_user_id:
+                assignee_notified = True
+        except Exception:
+            pass
 
     if assignee_label and not assignee_notified and alias and _bot_username:
         link = alias_join_link(alias["join_token"])
@@ -513,17 +525,6 @@ async def save_and_notify(
                 user_id,
                 f"⚠️ <b>{assignee_label}</b> ещё не подключился к боту.\n"
                 f"Перешлите приглашение:\n<a href=\"{link}\">{link}</a>",
-            )
-        except Exception:
-            pass
-    elif peer_id and not peer_notified and _bot_username and not assignee_label:
-        token = await db.create_notify_token(scope, chat_title_str)
-        link = f"https://t.me/{_bot_username}?start=notify_{token}"
-        try:
-            await bot.send_message(
-                user_id,
-                f"⚠️ Собеседнику не удалось отправить уведомление (нужно открыть бота).\n"
-                f"Перешлите ему ссылку:\n{link}",
             )
         except Exception:
             pass
@@ -561,21 +562,14 @@ async def send_reminder(task_id: int, text: str, scope: str, chat_title_str: str
         except Exception as e:
             log.warning(f"Cannot send reminder to chat {scope}: {e}")
 
-    notify_ids = list(await db.get_scope_user_ids(scope))
-    if task and task.get("assignee_user_id"):
-        aid = task["assignee_user_id"]
-        if aid not in notify_ids:
-            notify_ids.append(aid)
-    for uid in notify_ids:
-        try:
-            await bot.send_message(uid, f"🔔 {reminder_text}\n💬 {chat_title_str}")
-        except Exception:
-            pass
-
-
-async def ensure_scope_access(user_id: int, scope: str) -> bool:
-    user_scopes = await db.get_user_scopes(user_id)
-    return scope in user_scopes
+    if task:
+        creator_id = task["from_user_id"]
+        assignee_id = task.get("assignee_user_id")
+        for uid in dm_notify_recipients(creator_id, assignee_id, posted_to_chat=False):
+            try:
+                await bot.send_message(uid, f"🔔 {reminder_text}\n💬 {chat_title_str}")
+            except Exception:
+                pass
 
 
 # ════════════════════════════════════════════════════════════════
@@ -674,10 +668,8 @@ def _task_card(
     buttons: list[list[InlineKeyboardButton]] = []
     if alias and _bot_username and not alias.get("linked_user_id"):
         link = alias_join_link(alias["join_token"])
-        msg += f"\n\n👤 {alias['display_name']}: {link}"
-        share_text = (
-            f"Присоединись к задачам как «{alias['display_name']}»: {link}"
-        )
+        msg += f"\n\n👤 Подключить «{alias['display_name']}»: {link}"
+        share_text = alias_share_text(alias["display_name"])
         buttons.append([InlineKeyboardButton(
             text="🔔 Подключить участника",
             url=telegram_share_url(link, share_text),
@@ -824,26 +816,36 @@ async def cmd_task(message: Message) -> None:
     await create_task_from_text(message, command_args(message))
 
 
+async def reply_users_list(message: Message) -> None:
+    aliases = await db.list_user_aliases(message.from_user.id)
+    if not aliases:
+        await message.answer(
+            "👤 <b>Участники задач</b>\n\n"
+            "Пока никого нет. Создайте:\n"
+            "<code>/addusers женя</code>\n\n"
+            "В чате с человеком:\n"
+            "<code>@taskFaster_bot ночевка завтра в 17:00 с женя</code>",
+        )
+        return
+    lines = ["👤 <b>Ваши участники:</b>\n"]
+    for a in aliases:
+        st = "✅ подключён" if a.get("linked_user_id") else "⏳ ждёт подключения"
+        lines.append(f"• <b>{a['display_name']}</b> — {st}")
+    lines.append("\nДобавить: <code>/addusers имя</code>")
+    lines.append("Повторить приглашение: <code>/addusers имя</code>")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("users"))
+async def cmd_users(message: Message) -> None:
+    await reply_users_list(message)
+
+
 @dp.message(Command("addusers", "adduser"))
 async def cmd_addusers(message: Message) -> None:
     name = command_args(message).strip()
     if not name:
-        aliases = await db.list_user_aliases(message.from_user.id)
-        if not aliases:
-            await message.answer(
-                "👤 <b>Участники задач</b>\n\n"
-                "Создайте имя для исполнителя:\n"
-                "<code>/addusers женя</code>\n\n"
-                "Потом в чате:\n"
-                "<code>@taskFaster_bot ночевка завтра в 17:00 с женя</code>",
-            )
-            return
-        lines = ["👤 <b>Ваши участники:</b>\n"]
-        for a in aliases:
-            st = "✅ подключён" if a.get("linked_user_id") else "⏳ ждёт"
-            lines.append(f"• <b>{a['display_name']}</b> — {st}")
-        lines.append("\nДобавить: <code>/addusers имя</code>")
-        await message.answer("\n".join(lines))
+        await reply_users_list(message)
         return
     if len(name) > 32:
         await message.answer("❌ Имя слишком длинное (макс. 32 символа).")
@@ -919,7 +921,8 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         "  1️⃣ Inline: <code>@taskFaster_bot ночевка завтра в 19:00 с женя</code>\n"
         "     → нажми на карточку <b>над полем ввода</b>\n"
         "  2️⃣ Команда: <code>/task ночевка завтра в 19:00 с женя</code>\n"
-        "  3️⃣ Участники: <code>/addusers женя</code> — ссылка-приглашение\n\n"
+        "  3️⃣ Участники: <code>/addusers женя</code> — приглашение\n"
+        "     Список: <code>/users</code>\n\n"
         "<b>Форматы времени:</b>\n"
         "  • <code>завтра в 19:00</code> — завтра в 19:00\n"
         "  • <code>сегодня в 15:30</code> — сегодня в 15:30\n"
@@ -929,6 +932,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         "Задачи привязаны к <b>этому чату</b> — у каждой переписки свой список.\n\n"
         "<b>Команды:</b>\n"
         "/tasks — открытые задачи\n"
+        "/users — ваши участники (женя и др.)\n"
         "/archive — архив\n"
         "/notifications — уведомления\n"
         "/overdue — просроченные"
@@ -942,12 +946,11 @@ async def cmd_tasks(message: Message) -> None:
     await touch_scope(scope, chat_title(message), user_id)
 
     if message.chat.type == ChatType.PRIVATE and message.chat.id == user_id:
-        scopes = await db.get_user_scopes(user_id)
-        if not scopes:
+        tasks = await db.get_tasks_for_user(user_id)
+        if not tasks:
             await message.answer("📭 У тебя пока нет задач. Добавь через inline в чате!")
             return
-        tasks = await db.get_tasks_for_scopes(scopes)
-        text = format_tasks_list(tasks, "📋 <b>Твои открытые задачи (все чаты):</b>")
+        text = format_tasks_list(tasks, "📋 <b>Твои задачи:</b>")
     else:
         tasks = await db.get_tasks(scope)
         text = format_tasks_list(tasks)
@@ -963,8 +966,7 @@ async def cmd_archive(message: Message) -> None:
     await touch_scope(scope, chat_title(message), user_id)
 
     if message.chat.type == ChatType.PRIVATE and message.chat.id == user_id:
-        scopes = await db.get_user_scopes(user_id)
-        tasks = await db.get_archived_for_scopes(scopes)
+        tasks = await db.get_archived_for_user(user_id)
     else:
         tasks = await db.get_archived_tasks(scope)
 
@@ -992,8 +994,7 @@ async def cmd_overdue(message: Message) -> None:
     await touch_scope(scope, chat_title(message), user_id)
 
     if message.chat.type == ChatType.PRIVATE and message.chat.id == user_id:
-        scopes = await db.get_user_scopes(user_id)
-        tasks = await db.get_overdue_tasks(scopes) if scopes else []
+        tasks = await db.get_overdue_tasks_for_user(user_id)
     else:
         tasks = await db.get_overdue_tasks([scope])
 
@@ -1047,7 +1048,7 @@ async def cb_done_task(callback: CallbackQuery) -> None:
         return
 
     user_id = callback.from_user.id
-    if not await ensure_scope_access(user_id, task["scope"]):
+    if not await ensure_task_access(user_id, task):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
@@ -1099,11 +1100,20 @@ async def morning_digest() -> None:
                 except Exception as e:
                     log.warning(f"Morning digest to {scope}: {e}")
 
-            for uid in await db.get_scope_user_ids(scope):
-                try:
-                    await bot.send_message(uid, "\n\n".join(lines))
-                except Exception:
-                    pass
+            notified: set[int] = set()
+            for t in scope_tasks:
+                for uid in dm_notify_recipients(
+                    t["from_user_id"],
+                    t.get("assignee_user_id"),
+                    posted_to_chat=bool(is_telegram_chat(scope) and scope not in _opaque_scopes),
+                ):
+                    if uid in notified:
+                        continue
+                    notified.add(uid)
+                    try:
+                        await bot.send_message(uid, "\n\n".join(lines))
+                    except Exception:
+                        pass
     except Exception as e:
         log.error(f"Morning digest error: {e}")
 
