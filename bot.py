@@ -74,6 +74,10 @@ _inline_user_chat_type: dict[int, str] = {}
 # «ночевка завтра в 17:00 с <имя>»
 _pending_add_user: set[int] = set()
 _pending_task_input: dict[int, str] = {}  # personal | shared
+
+
+def cancel_pending_task_input(user_id: int) -> None:
+    _pending_task_input.pop(user_id, None)
 _ASSIGNEE_SUFFIX_RE = re.compile(
     r"\s+(?:с|для)\s+([a-zA-Zа-яА-ЯёЁ0-9_.\-]{2,32})\s*$",
     re.IGNORECASE,
@@ -489,16 +493,17 @@ def main_menu_text() -> str:
     )
 
 
-def dm_chat_label(
+async def dm_chat_label(
     recipient_id: int,
+    creator_id: int,
     chat_title_str: str,
     assignee_user_id: int | None,
-    assignee_label: str | None,
 ) -> str:
-    """Подпись чата в личном уведомлении (для исполнителя — как его записал автор)."""
+    """Для исполнителя — как он записал автора задачи в «Участники»."""
     if assignee_user_id and recipient_id == assignee_user_id:
-        if assignee_label:
-            return f"Личка с {assignee_label}"
+        alias = await db.get_alias_by_linked_user(recipient_id, creator_id)
+        if alias:
+            return f"Личка с {alias['display_name']}"
         return "Личка с пользователем"
     return chat_title_str
 
@@ -776,7 +781,7 @@ async def save_and_notify(
         if reminder_at:
             short += f" 🔔 в {fmt_datetime(reminder_at)}"
         await db.add_notification(uid, scope, task_id, short)
-        chat_label = dm_chat_label(uid, chat_title_str, assignee_user_id, assignee_label)
+        chat_label = await dm_chat_label(uid, user_id, chat_title_str, assignee_user_id)
         try:
             await bot.send_message(uid, f"🔔 {short}\n💬 {chat_label}")
             if assignee_user_id and uid == assignee_user_id:
@@ -837,12 +842,7 @@ async def send_reminder(task_id: int, text: str, scope: str, chat_title_str: str
             reminder_text = (
                 f"🔔 <b>Напоминание о задаче!</b> #{num}{assignee_line}\n📝 {text}"
             )
-            chat_label = dm_chat_label(
-                uid,
-                chat_title_str,
-                assignee_id,
-                task.get("assignee_label"),
-            )
+            chat_label = await dm_chat_label(uid, creator_id, chat_title_str, assignee_id)
             try:
                 await bot.send_message(uid, f"🔔 {reminder_text}\n💬 {chat_label}")
             except Exception:
@@ -1124,6 +1124,7 @@ async def create_task_from_text(
 
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message) -> None:
+    cancel_pending_task_input(message.from_user.id)
     await show_main_menu(message)
 
 
@@ -1234,6 +1235,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 
     scope = scope_from_message(message)
     await touch_scope(scope, chat_title(message), user_id)
+    cancel_pending_task_input(user_id)
     await show_main_menu(message)
 
 
@@ -1250,6 +1252,7 @@ async def cmd_tasks(message: Message) -> None:
     user_id = message.from_user.id
     await touch_scope(scope_from_message(message), chat_title(message), user_id)
     if _is_private_bot_chat(message):
+        cancel_pending_task_input(user_id)
         await show_main_menu(message)
         return
     await message.answer(
@@ -1369,6 +1372,7 @@ async def on_bot_added(event: ChatMemberUpdated) -> None:
 
 @dp.callback_query(F.data == "menu_main")
 async def cb_menu_main(callback: CallbackQuery) -> None:
+    cancel_pending_task_input(callback.from_user.id)
     await callback.answer()
     await show_main_menu(callback.message, edit=True)
 

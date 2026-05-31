@@ -424,6 +424,19 @@ async def list_user_aliases(owner_id: int) -> list[dict]:
         return [_alias_row(r) for r in rows]
 
 
+async def get_alias_by_linked_user(owner_id: int, linked_user_id: int) -> dict | None:
+    """Участник у owner_id, привязанный к linked_user_id (как записан в «Участники»)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, owner_id, alias_key, display_name, linked_user_id, join_token, created_at "
+            "FROM user_aliases WHERE owner_id=? AND linked_user_id=? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (owner_id, linked_user_id),
+        )
+        row = await cursor.fetchone()
+        return _alias_row(row) if row else None
+
+
 async def get_user_alias_by_id(owner_id: int, alias_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
