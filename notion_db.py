@@ -4,6 +4,7 @@ scope — идентификатор чата: telegram chat_id (строка) �
 """
 import aiosqlite
 import os
+import secrets
 from datetime import datetime, date
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "assistant.db")
@@ -45,6 +46,22 @@ async def init_db() -> None:
                 text       TEXT    NOT NULL,
                 created_at TEXT    NOT NULL,
                 is_read    INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_instance_map (
+                chat_instance TEXT PRIMARY KEY,
+                scope         TEXT NOT NULL,
+                chat_title    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS scope_notify_tokens (
+                token      TEXT PRIMARY KEY,
+                scope      TEXT NOT NULL,
+                chat_title TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
         """)
         await db.commit()
@@ -194,6 +211,54 @@ async def get_scope_user_ids(scope: str) -> list[int]:
 async def get_last_scope(user_id: int) -> str | None:
     scopes = await get_user_scopes(user_id)
     return scopes[0] if scopes else None
+
+
+async def save_chat_instance_scope(chat_instance: str, scope: str, chat_title: str) -> None:
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO chat_instance_map (chat_instance, scope, chat_title, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(chat_instance) DO UPDATE SET
+                 scope=excluded.scope,
+                 chat_title=excluded.chat_title,
+                 updated_at=excluded.updated_at""",
+            (chat_instance, scope, chat_title, now),
+        )
+        await db.commit()
+
+
+async def get_chat_instance_scope(chat_instance: str) -> tuple[str, str] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT scope, chat_title FROM chat_instance_map WHERE chat_instance=?",
+            (chat_instance,),
+        )
+        row = await cursor.fetchone()
+        return (row[0], row[1]) if row else None
+
+
+async def create_notify_token(scope: str, chat_title: str) -> str:
+    token = secrets.token_urlsafe(9).replace("-", "x").replace("_", "y")[:16]
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO scope_notify_tokens (token, scope, chat_title, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (token, scope, chat_title, now),
+        )
+        await db.commit()
+    return token
+
+
+async def resolve_notify_token(token: str) -> tuple[str, str] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT scope, chat_title FROM scope_notify_tokens WHERE token=?",
+            (token,),
+        )
+        row = await cursor.fetchone()
+        return (row[0], row[1]) if row else None
 
 
 # ─────────────────────────── ЗАДАЧИ ─────────────────────────────

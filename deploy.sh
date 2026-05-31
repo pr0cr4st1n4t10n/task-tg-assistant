@@ -12,7 +12,7 @@ PROJECT_DIR="/root/tg-assistant"
 # 1. Копируем файлы
 echo "[1/5] Копируем файлы..."
 mkdir -p "$PROJECT_DIR"
-cp bot.py analyzer.py notion_db.py requirements.txt "$PROJECT_DIR/"
+cp bot.py analyzer.py notion_db.py requirements.txt tg-assistant.service "$PROJECT_DIR/"
 
 # 2. Копируем .env если ещё нет
 if [ ! -f "$PROJECT_DIR/.env" ]; then
@@ -33,8 +33,7 @@ echo "    ✅ Зависимости установлены"
 
 # 4. systemd сервис
 echo "[3/5] Устанавливаем systemd сервис..."
-cp /root/tg-assistant/../tg-assistant/tg-assistant.service /etc/systemd/system/tg-assistant.service 2>/dev/null || \
-    cp tg-assistant.service /etc/systemd/system/tg-assistant.service
+cp "$PROJECT_DIR/tg-assistant.service" /etc/systemd/system/tg-assistant.service
 systemd-analyze verify /etc/systemd/system/tg-assistant.service 2>/dev/null || true
 systemctl daemon-reload
 echo "    ✅ Сервис зарегистрирован"

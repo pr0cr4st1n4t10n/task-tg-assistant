@@ -3,12 +3,13 @@ import hashlib
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType, ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     Message,
     InlineKeyboardMarkup,
@@ -19,6 +20,7 @@ from aiogram.types import (
     InputTextMessageContent,
     ChosenInlineResult,
     ChatMemberUpdated,
+    BusinessConnection,
 )
 from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -56,6 +58,14 @@ _inline_scope: dict[int, tuple[str, str]] = {}
 _chat_instance_scope: dict[str, tuple[str, str]] = {}
 # scope = chat_instance (нет числового chat_id) — в чат через API не отправить
 _opaque_scopes: set[str] = set()
+# user_id -> (scope, title, unix_ts) — последняя личная переписка (business / private)
+_recent_private_chat: dict[int, tuple[str, str, float]] = {}
+# business_connection_id -> владелец аккаунта user_id
+_business_owner: dict[str, int] = {}
+# username бота для deep-link
+_bot_username: str = ""
+# user_id -> последний chat_type из inline_query
+_inline_user_chat_type: dict[int, str] = {}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -65,6 +75,25 @@ _opaque_scopes: set[str] = set()
 def now_moscow() -> datetime:
     """Текущее время в Москве (naive, для сравнений и планировщика)."""
     return datetime.now(MOSCOW).replace(tzinfo=None)
+
+
+def get_chat_instance(obj) -> str | None:
+    """chat_instance есть у ChosenInlineResult (extra), но не у InlineQuery."""
+    value = getattr(obj, "chat_instance", None)
+    if value is not None:
+        return str(value)
+    extra = getattr(obj, "model_extra", None) or {}
+    raw = extra.get("chat_instance")
+    return str(raw) if raw is not None else None
+
+
+def remember_private_chat(user_id: int, scope: str, title: str) -> None:
+    _recent_private_chat[user_id] = (scope, title, time.time())
+    _inline_scope[user_id] = (scope, title)
+
+
+def is_self_scope(scope: str, user_id: int) -> bool:
+    return scope == str(user_id)
 
 
 def fmt_date(iso: str | None) -> str:
@@ -262,42 +291,77 @@ def _private_peer_user_id(scope: str, creator_id: int) -> int | None:
     return None
 
 
+async def _bind_chat_instance(chat_instance: str, scope: str, title: str) -> None:
+    pair = (scope, title)
+    _chat_instance_scope[chat_instance] = pair
+    await db.save_chat_instance_scope(chat_instance, scope, title)
+    if scope == chat_instance:
+        _opaque_scopes.add(scope)
+
+
+async def predicted_scope_for_user(
+    user_id: int,
+    chat_type: str | None = None,
+) -> tuple[str, str] | None:
+    """Лучший известный scope для inline в личке с собеседником."""
+    entry = _recent_private_chat.get(user_id)
+    if entry and time.time() - entry[2] < 900:
+        if chat_type in (None, "private", "sender"):
+            return entry[0], entry[1]
+
+    if user_id in _inline_scope:
+        scope, title = _inline_scope[user_id]
+        if not is_self_scope(scope, user_id):
+            return scope, title
+
+    last = await db.get_last_scope(user_id)
+    if last and not is_self_scope(last, user_id):
+        return last, await scope_title(last, "Личный чат")
+
+    return None
+
+
 async def resolve_scope_from_chat_instance(
     chat_instance: str,
     user_id: int,
+    chat_type: str | None = None,
 ) -> tuple[str, str]:
     if chat_instance in _chat_instance_scope:
         return _chat_instance_scope[chat_instance]
 
-    if user_id in _inline_scope:
-        scope, title = _inline_scope[user_id]
-        _chat_instance_scope[chat_instance] = (scope, title)
-        return scope, title
+    stored = await db.get_chat_instance_scope(chat_instance)
+    if stored:
+        _chat_instance_scope[chat_instance] = stored
+        return stored
 
-    last = await db.get_last_scope(user_id)
-    if last:
-        title = await scope_title(last, "Личный чат")
-        pair = (last, title)
-        _chat_instance_scope[chat_instance] = pair
-        return pair
+    predicted = await predicted_scope_for_user(user_id, chat_type)
+    if predicted:
+        scope, title = predicted
+        await _bind_chat_instance(chat_instance, scope, title)
+        return scope, title
 
     title = "Личный чат"
     pair = (chat_instance, title)
     _chat_instance_scope[chat_instance] = pair
     _opaque_scopes.add(chat_instance)
+    await db.save_chat_instance_scope(chat_instance, chat_instance, title)
     return pair
 
 
-async def resolve_inline_scope(user_id: int) -> tuple[str, str]:
+async def resolve_inline_scope(
+    user_id: int,
+    chat_type: str | None = None,
+) -> tuple[str, str]:
+    predicted = await predicted_scope_for_user(user_id, chat_type)
+    if predicted:
+        return predicted
+
     if user_id in _inline_scope:
-        return _inline_scope[user_id]
+        scope, title = _inline_scope[user_id]
+        if not is_self_scope(scope, user_id):
+            return scope, title
 
-    last = await db.get_last_scope(user_id)
-    if last:
-        title = await scope_title(last, "Чат")
-        return last, title
-
-    return str(user_id), "Личный чат (уточните: напишите боту из нужного чата или /task)"
+    return str(user_id), "Личка с ботом"
 
 
 async def touch_scope(scope: str, title: str, user_id: int) -> None:
@@ -345,13 +409,28 @@ async def save_and_notify(
     if reminder_at:
         short += f" 🔔 в {fmt_datetime(reminder_at)}"
 
+    peer_notified = False
     for uid in member_ids:
         await db.add_notification(uid, scope, task_id, short)
         if uid != user_id or not posted_to_chat:
             try:
                 await bot.send_message(uid, f"🔔 {short}\n💬 {chat_title_str}")
+                if peer_id and uid == peer_id:
+                    peer_notified = True
             except Exception:
                 pass
+
+    if peer_id and not peer_notified and _bot_username:
+        token = await db.create_notify_token(scope, chat_title_str)
+        link = f"https://t.me/{_bot_username}?start=notify_{token}"
+        try:
+            await bot.send_message(
+                user_id,
+                f"⚠️ Собеседнику не удалось отправить уведомление (нужно открыть бота).\n"
+                f"Перешлите ему ссылку:\n{link}",
+            )
+        except Exception:
+            pass
 
     # Если есть напоминание, планируем его
     if reminder_at:
@@ -405,10 +484,13 @@ async def handle_inline(inline_query: InlineQuery) -> None:
     query = inline_query.query.strip()
     user = inline_query.from_user
     
+    chat_type = inline_query.chat_type
     log.info(
         "Inline query uid=%s chat_type=%s q=%r",
-        user.id, inline_query.chat_type, query,
+        user.id, chat_type, query,
     )
+    if chat_type:
+        _inline_user_chat_type[user.id] = chat_type
 
     try:
         if not query:
@@ -430,10 +512,15 @@ async def handle_inline(inline_query: InlineQuery) -> None:
             text = result.task_text or clean_query
             card_id = _inline_result_id(user.id, query, "auto" if result.is_task else "manual")
             
+            predicted = await predicted_scope_for_user(user.id, chat_type)
+            notify_token = None
+            if predicted:
+                notify_token = await db.create_notify_token(predicted[0], predicted[1])
+
             if result.is_task:
-                results = [_task_card(card_id, text, result.deadline, reminder_at)]
+                results = [_task_card(card_id, text, result.deadline, reminder_at, notify_token=notify_token)]
             else:
-                results = [_task_card(card_id, query, None, reminder_at, manual=True)]
+                results = [_task_card(card_id, query, None, reminder_at, manual=True, notify_token=notify_token)]
 
         await inline_query.answer(results, cache_time=1, is_personal=False)
         log.info("Inline answered uid=%s results=%d", user.id, len(results))
@@ -460,6 +547,7 @@ def _task_card(
     deadline: str | None,
     reminder_at: str | None = None,
     manual: bool = False,
+    notify_token: str | None = None,
 ) -> InlineQueryResultArticle:
     title = "📝 Сохранить как задачу" if manual else "📝 Задача — нажми чтобы отправить"
     deadline_hint = f" (до {fmt_date(deadline)})" if deadline else ""
@@ -467,14 +555,27 @@ def _task_card(
     deadline_line = f"\n⏰ Дедлайн: {fmt_date(deadline)}" if deadline else ""
     reminder_line = f"\n🔔 Напоминание: {fmt_datetime(reminder_at)}" if reminder_at else ""
     msg = f"[Бот]\nДобавил задачу в список!\n📝 {text}{deadline_line}{reminder_line}"
+    if notify_token and _bot_username:
+        msg += f"\n\n🔔 Собеседник: t.me/{_bot_username}?start=notify_{notify_token}"
+
+    reply_markup = None
+    if notify_token and _bot_username:
+        reply_markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🔔 Подписаться на уведомления",
+                url=f"https://t.me/{_bot_username}?start=notify_{notify_token}",
+            ),
+        ]])
+
     return InlineQueryResultArticle(
         id=result_id,
         title=title,
         description=f"{text[:100]}{deadline_hint}{reminder_hint}",
         input_message_content=InputTextMessageContent(
             message_text=msg,
-            parse_mode=None,  # здесь нет HTML, поэтому теги не нужны
+            parse_mode=None,
         ),
+        reply_markup=reply_markup,
     )
 
 
@@ -486,16 +587,23 @@ async def handle_chosen(chosen: ChosenInlineResult) -> None:
     user = chosen.from_user
     name = sender_name(user)
 
-    chat_instance = getattr(chosen, "chat_instance", None)
-    if chat_instance:
-        scope, chat_title_str = await resolve_scope_from_chat_instance(str(chat_instance), user.id)
-    else:
-        scope, chat_title_str = await resolve_inline_scope(user.id)
+    chat_instance = get_chat_instance(chosen)
+    chat_type = _inline_user_chat_type.get(user.id)
 
-    _inline_scope[user.id] = (scope, chat_title_str)
     if chat_instance:
-        _chat_instance_scope[str(chat_instance)] = (scope, chat_title_str)
+        scope, chat_title_str = await resolve_scope_from_chat_instance(
+            chat_instance, user.id, chat_type,
+        )
+    else:
+        scope, chat_title_str = await resolve_inline_scope(user.id, chat_type)
+
+    remember_private_chat(user.id, scope, chat_title_str)
+    if chat_instance:
+        await _bind_chat_instance(chat_instance, scope, chat_title_str)
     await touch_scope(scope, chat_title_str, user.id)
+    peer_id = _private_peer_user_id(scope, user.id)
+    if peer_id:
+        await touch_scope(scope, chat_title_str, peer_id)
 
     # Извлекаем время напоминания и чистим текст
     reminder_at, clean_query = parse_reminder_time(query)
@@ -564,10 +672,55 @@ async def cmd_task(message: Message) -> None:
     await create_task_from_text(message, command_args(message))
 
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+@dp.business_connection()
+async def on_business_connection(connection: BusinessConnection) -> None:
+    if connection.is_enabled:
+        _business_owner[connection.id] = connection.user.id
+        log.info("Business connected: %s user=%s", connection.id, connection.user.id)
+    else:
+        _business_owner.pop(connection.id, None)
+
+
+@dp.business_message()
+async def on_business_message(message: Message) -> None:
+    if not message.chat or message.from_user and message.from_user.is_bot:
+        return
+    scope = str(message.chat.id)
+    title = chat_title(message)
+    conn_id = message.business_connection_id or ""
+    owner_id = _business_owner.get(conn_id) or (OWNER_ID if OWNER_ID else None)
+    customer_id = message.chat.id
+
+    await touch_scope(scope, title, customer_id)
+    if owner_id:
+        remember_private_chat(owner_id, scope, title)
+        await touch_scope(scope, title, owner_id)
+    elif message.from_user and not is_self_scope(scope, message.from_user.id):
+        remember_private_chat(message.from_user.id, scope, title)
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message, command: CommandObject) -> None:
+    user_id = message.from_user.id
+    args = (command.args or "").strip()
+
+    if args.startswith("notify_"):
+        token = args[7:]
+        resolved = await db.resolve_notify_token(token)
+        if resolved:
+            scope, title = resolved
+            await touch_scope(scope, title, user_id)
+            remember_private_chat(user_id, scope, title)
+            await message.answer(
+                f"✅ Уведомления для чата <b>{title}</b> включены.\n"
+                "Вы будете получать напоминания о задачах из этой переписки."
+            )
+            return
+        await message.answer("❌ Ссылка устарела. Попросите отправить задачу ещё раз.")
+        return
+
     scope = scope_from_message(message)
-    await touch_scope(scope, chat_title(message), message.from_user.id)
+    await touch_scope(scope, chat_title(message), user_id)
     await message.answer(
         "👋 <b>ProcrastinationManager активен!</b>\n\n"
         "<b>Добавить задачу:</b>\n"
@@ -670,8 +823,12 @@ async def handle_chat_activity(message: Message) -> None:
         return
     scope = scope_from_message(message)
     title = chat_title(message)
-    await touch_scope(scope, title, message.from_user.id)
-    _inline_scope[message.from_user.id] = (scope, title)
+    uid = message.from_user.id
+    await touch_scope(scope, title, uid)
+    _inline_scope[uid] = (scope, title)
+    if message.chat.type == ChatType.PRIVATE and message.chat.id != uid:
+        remember_private_chat(uid, scope, title)
+        await touch_scope(scope, title, message.chat.id)
 
 
 @dp.my_chat_member()
@@ -763,6 +920,7 @@ async def morning_digest() -> None:
 # ════════════════════════════════════════════════════════════════
 
 async def main() -> None:
+    global _bot_username
     log.info("Starting bot...")
     try:
         await db.init_db()
@@ -772,7 +930,8 @@ async def main() -> None:
     log.info("Database OK")
     try:
         me = await bot.get_me()
-        log.info("Bot authorized: @%s", me.username)
+        _bot_username = me.username or ""
+        log.info("Bot authorized: @%s", _bot_username)
     except TelegramUnauthorizedError:
         log.error(
             "Неверный BOT_TOKEN. Получи новый у @BotFather → /mybots → Bot Settings → API Token, "
@@ -804,6 +963,7 @@ async def main() -> None:
         allowed_updates=[
             "message", "inline_query", "chosen_inline_result",
             "callback_query", "my_chat_member",
+            "business_connection", "business_message",
         ],
     )
 
