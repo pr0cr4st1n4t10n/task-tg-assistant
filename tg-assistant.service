@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Business Assistant Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/tg-assistant
+EnvironmentFile=/root/tg-assistant/.env
+ExecStart=/root/tg-assistant/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
