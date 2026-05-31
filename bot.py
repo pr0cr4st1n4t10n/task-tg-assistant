@@ -26,14 +26,15 @@ from aiogram.types import (
 )
 from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from aiogram.exceptions import TelegramBadRequest, TelegramUnauthorizedError
+from aiogram.exceptions import TelegramUnauthorizedError
 from dotenv import load_dotenv
 
 import notion_db as db
 from analyzer import analyze_message
-from premium_emoji import PE, e, ib
+from premium_emoji import PE, e, ib, install_html_send_patch, is_premium_emoji_enabled
 
 load_dotenv()
+install_html_send_patch()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -477,8 +478,8 @@ def users_delete_confirm_keyboard(alias_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def main_menu_text(*, plain_emoji: bool = False) -> str:
-    smile = "😊" if plain_emoji else e(PE.SMILE)
+def main_menu_text() -> str:
+    smile = e(PE.SMILE)
     return (
         f"{smile} <b>TaskManager</b>\n\n"
         "Выберите действие кнопкой ниже.\n\n"
@@ -540,18 +541,9 @@ async def show_main_menu(message: Message, edit: bool = False) -> None:
         try:
             await message.edit_text(text, reply_markup=kb)
             return
-        except TelegramBadRequest:
-            try:
-                await message.edit_text(main_menu_text(plain_emoji=True), reply_markup=kb)
-                return
-            except Exception:
-                pass
         except Exception:
             pass
-    try:
-        await message.answer(text, reply_markup=kb)
-    except TelegramBadRequest:
-        await message.answer(main_menu_text(plain_emoji=True), reply_markup=kb)
+    await message.answer(text, reply_markup=kb)
 
 
 async def show_task_list(
@@ -1781,6 +1773,10 @@ async def main() -> None:
         me = await bot.get_me()
         _bot_username = me.username or ""
         log.info("Bot authorized: @%s", _bot_username)
+        if is_premium_emoji_enabled():
+            log.info("Premium emoji in messages: enabled (set PREMIUM_EMOJI=0 to disable)")
+        else:
+            log.info("Premium emoji in messages: disabled (PREMIUM_EMOJI=0)")
     except TelegramUnauthorizedError:
         log.error(
             "Неверный BOT_TOKEN. Получи новый у @BotFather → /mybots → Bot Settings → API Token, "
